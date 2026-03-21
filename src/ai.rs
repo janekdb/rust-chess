@@ -584,6 +584,11 @@ fn evaluate_king_safety(board: &shakmaty::Board, endgame: bool) -> i32 {
     let mut black_king: Option<(i32, i32)> = None;
     let mut white_pawn_squares: Vec<(i32, i32)> = Vec::with_capacity(8);
     let mut black_pawn_squares: Vec<(i32, i32)> = Vec::with_capacity(8);
+    // Track whether each side has heavy pieces (rook or queen) that can
+    // exploit an open file in front of the enemy king.  Without heavy pieces
+    // the open-file penalty is meaningless and only distorts evaluation.
+    let mut white_has_heavy = false;
+    let mut black_has_heavy = false;
 
     for (sq, Piece { color, role }) in board {
         let f = sq.file() as i32;
@@ -593,6 +598,8 @@ fn evaluate_king_safety(board: &shakmaty::Board, endgame: bool) -> i32 {
             (Color::Black, Role::King) => black_king = Some((f, r)),
             (Color::White, Role::Pawn) => white_pawn_squares.push((f, r)),
             (Color::Black, Role::Pawn) => black_pawn_squares.push((f, r)),
+            (Color::White, Role::Rook) | (Color::White, Role::Queen) => white_has_heavy = true,
+            (Color::Black, Role::Rook) | (Color::Black, Role::Queen) => black_has_heavy = true,
             _ => {}
         }
     }
@@ -635,16 +642,24 @@ fn evaluate_king_safety(board: &shakmaty::Board, endgame: bool) -> i32 {
     // centre pawn unnecessarily in the middlegame.
     const OPEN_FILE_PENALTY: i32 = 20;
 
-    if let Some((kf, kr)) = white_king {
-        let has_pawn_ahead = white_pawn_squares.iter().any(|&(pf, pr)| pf == kf && pr > kr);
-        if !has_pawn_ahead {
-            score -= OPEN_FILE_PENALTY;
+    // Apply open-file penalty only when the enemy has at least one rook or
+    // queen that can actually exploit the open file.  Without heavy pieces the
+    // penalty is spurious and distorts evaluation in queenless middlegames and
+    // endgames where endgame detection hasn't yet kicked in.
+    if black_has_heavy {
+        if let Some((kf, kr)) = white_king {
+            let has_pawn_ahead = white_pawn_squares.iter().any(|&(pf, pr)| pf == kf && pr > kr);
+            if !has_pawn_ahead {
+                score -= OPEN_FILE_PENALTY;
+            }
         }
     }
-    if let Some((kf, kr)) = black_king {
-        let has_pawn_ahead = black_pawn_squares.iter().any(|&(pf, pr)| pf == kf && pr < kr);
-        if !has_pawn_ahead {
-            score += OPEN_FILE_PENALTY; // bad for black = good for white
+    if white_has_heavy {
+        if let Some((kf, kr)) = black_king {
+            let has_pawn_ahead = black_pawn_squares.iter().any(|&(pf, pr)| pf == kf && pr < kr);
+            if !has_pawn_ahead {
+                score += OPEN_FILE_PENALTY; // bad for black = good for white
+            }
         }
     }
 
@@ -695,7 +710,7 @@ pub fn evaluate(pos: &Chess) -> i32 {
 fn quiescence_impl(
     pos: &Chess,
     mut alpha: i32,
-    beta: i32,
+    mut beta: i32,
     qdepth: i32,
     history: &[[i32; 64]; 64],
     cached_stand_pat: Option<i32>,
@@ -752,6 +767,7 @@ fn quiescence_impl(
                 }
                 TT_BOUND_UPPER => {
                     if e.score <= alpha { return alpha; }
+                    if e.score < beta   { beta = e.score; }
                 }
                 _ => {}
             }
@@ -7029,5 +7045,150 @@ mod tests {
         let expected = piece_value(Role::Rook) + (piece_value(Role::Queen) - piece_value(Role::Pawn));
         assert_eq!(gain, expected,
             "fix #52: capture+promotion gain must be {}; got {}", expected, gain);
+    }
+
+    // ── Fix: QS TT_BOUND_UPPER beta tightening ─────────────────────────────
+    //
+    // Before the fix, quiescence_impl's TT_BOUND_UPPER arm only checked
+    // `e.score <= alpha → return alpha` but never tightened beta when
+    // alpha < e.score < beta.  The negamax TT probe has always tightened beta
+    // in this case; quiescence was missing the same line.
+
+    /// When a TT UPPER-bound entry is present with score between alpha and beta,
+    /// QS must still return a result consistent with a fresh search.  The fix
+    /// tightens beta; the result must be ≤ the UPPER bound score.
+    #[test]
+    fn test_qs_upper_bound_beta_tightening_consistent_with_fresh() {
+        // Symmetric pawn position — not a draw by insufficient material (pawns can queen),
+        // no captures available for either side, so QS returns stand-pat directly.
+        let pos = pos_from_fen("k7/p7/8/8/8/8/7P/K7 w - - 0 1");
+        let history = [[0i32; 64]; 64];
+        // Fresh search to get true score T.
+        let mut tt_fresh = vec![TtEntry::default(); 1 << 16];
+        let t = quiescence_impl(&pos, -32001, 32001, 6, &history, None, &mut tt_fresh);
+
+        // Pre-seed TT with a legitimate UPPER bound at T+50 (valid since true_score ≤ T+50).
+        let hash = u64::from(pos.zobrist_hash::<Zobrist64>(EnPassantMode::Legal));
+        let mut tt_seeded = vec![TtEntry::default(); 1 << 16];
+        let tt_idx = (hash as usize) & (tt_seeded.len() - 1);
+        tt_seeded[tt_idx] = TtEntry {
+            hash, depth: 0, score: t + 50, bound: TT_BOUND_UPPER,
+            best_from: TT_NO_SQUARE, best_to: TT_NO_SQUARE,
+        };
+        // Search with window [T-10, T+100]: UPPER entry at T+50 is between alpha and beta.
+        // With beta tightening: effective beta = T+50; result must still be T.
+        let result = quiescence_impl(&pos, t - 10, t + 100, 6, &history, None, &mut tt_seeded);
+        assert_eq!(result, t,
+            "fix: QS with UPPER bound entry must return same result as fresh search: fresh={t} seeded={result}");
+    }
+
+    /// When a TT UPPER-bound entry is present and its score is between alpha and
+    /// beta, the search result must not exceed the UPPER bound score — the
+    /// tightened beta acts as a ceiling.
+    #[test]
+    fn test_qs_upper_bound_result_does_not_exceed_tt_score() {
+        // Position with a white material advantage so score is positive and non-trivial.
+        let pos = pos_from_fen("k7/8/8/8/8/8/8/K2Q4 w - - 0 1"); // White queen advantage
+        let history = [[0i32; 64]; 64];
+        // Fresh score.
+        let mut tt_fresh = vec![TtEntry::default(); 1 << 16];
+        let t = quiescence_impl(&pos, -32001, 32001, 6, &history, None, &mut tt_fresh);
+        assert!(t > 0, "precondition: white advantage position should score > 0: {t}");
+
+        // Pre-seed a valid UPPER bound at T+10.
+        let hash = u64::from(pos.zobrist_hash::<Zobrist64>(EnPassantMode::Legal));
+        let mut tt_seeded = vec![TtEntry::default(); 1 << 16];
+        let tt_idx = (hash as usize) & (tt_seeded.len() - 1);
+        tt_seeded[tt_idx] = TtEntry {
+            hash, depth: 0, score: t + 10, bound: TT_BOUND_UPPER,
+            best_from: TT_NO_SQUARE, best_to: TT_NO_SQUARE,
+        };
+        // Wide window so the UPPER bound falls strictly inside [alpha, beta].
+        let result = quiescence_impl(&pos, t - 20, t + 100, 6, &history, None, &mut tt_seeded);
+        // Result must equal fresh score (UPPER bound at T+10 is loose enough not to cut).
+        assert_eq!(result, t,
+            "fix: result with loose UPPER bound must equal fresh score: t={t} result={result}");
+        // And result must be ≤ the UPPER bound entry (T+10).
+        assert!(result <= t + 10,
+            "fix: result must not exceed TT UPPER bound score: result={result} upper={}", t + 10);
+    }
+
+    /// Regression: when a TT UPPER-bound entry has score ≤ alpha, QS must still
+    /// return alpha immediately (the existing early-return path must not be broken
+    /// by the beta-tightening addition).
+    #[test]
+    fn test_qs_upper_bound_alpha_cutoff_unaffected() {
+        // Quiet position with pawns — not drawn, no captures available.
+        let pos = pos_from_fen("k7/p7/8/8/8/8/7P/K7 w - - 0 1");
+        let history = [[0i32; 64]; 64];
+        let mut tt = vec![TtEntry::default(); 1 << 16];
+        let hash = u64::from(pos.zobrist_hash::<Zobrist64>(EnPassantMode::Legal));
+        let tt_idx = (hash as usize) & (tt.len() - 1);
+        // Store UPPER bound at -500: claims true score ≤ -500, well below alpha=-100.
+        tt[tt_idx] = TtEntry {
+            hash, depth: 0, score: -500, bound: TT_BOUND_UPPER,
+            best_from: TT_NO_SQUARE, best_to: TT_NO_SQUARE,
+        };
+        // Search with alpha=-100: -500 ≤ -100 → must return alpha = -100 immediately.
+        let result = quiescence_impl(&pos, -100, 100, 6, &history, None, &mut tt);
+        assert_eq!(result, -100,
+            "regression: UPPER bound score ≤ alpha must still return alpha: {result}");
+    }
+
+    // ── Fix: king open-file penalty gated on enemy heavy pieces ────────────
+    //
+    // Before the fix, evaluate_king_safety applied a 20 cp OPEN_FILE_PENALTY
+    // for an open file in front of the king even when the enemy had no rooks
+    // or queens to exploit it.  The penalty is now conditioned on the enemy
+    // having at least one rook or queen.
+
+    /// With no pawns and no heavy pieces on either side, neither king should
+    /// receive an open-file penalty — the fix ensures the penalty is zero
+    /// when no heavy pieces are present to exploit the open file.
+    #[test]
+    fn test_king_open_file_no_penalty_without_heavy_pieces() {
+        // Both kings on open files, no pawns, no rooks or queens.
+        let board = board_from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1");
+        let ks = evaluate_king_safety(&board, false);
+        assert_eq!(ks, 0,
+            "fix: no open-file penalty when neither side has heavy pieces: {ks}");
+    }
+
+    /// When White has a rook, Black's open king file should incur the penalty
+    /// (White can exploit it).
+    #[test]
+    fn test_king_open_file_penalty_with_enemy_rook() {
+        // White king a1, White rook h1; Black king e8, no pawn on e-file.
+        // White has a rook → Black's open e-file should be penalised (+20 for white).
+        let board = board_from_fen("4k3/8/8/8/8/8/8/K6R w - - 0 1");
+        let ks = evaluate_king_safety(&board, false);
+        // White king a1: no pawn ahead on a-file; Black has no heavy pieces → no penalty for white king.
+        // Black king e8: no pawn on e-file ahead; White has a rook → +20 for white.
+        // White shield bonus: no pawn directly in front of Ka1 on rank 2, file a → no shield.
+        // Net: +20 (black open-file penalty).
+        assert!(ks > 0,
+            "fix: open black king file with enemy rook must produce positive score for white: {ks}");
+        // Baseline: same position without the rook (no heavy pieces) → no penalty.
+        let board_no_rook = board_from_fen("4k3/8/8/8/8/8/8/K7 w - - 0 1");
+        let ks_no_rook = evaluate_king_safety(&board_no_rook, false);
+        assert!(ks > ks_no_rook,
+            "fix: adding an enemy rook must increase penalty for open king file: with_rook={ks} without={ks_no_rook}");
+    }
+
+    /// Same as above but with a queen instead of a rook.
+    #[test]
+    fn test_king_open_file_penalty_with_enemy_queen() {
+        // White queen d1 can exploit Black's open e-file.
+        let board = board_from_fen("4k3/8/8/8/8/8/8/3QK3 w - - 0 1");
+        let ks = evaluate_king_safety(&board, false);
+        // White king e1: no pawn ahead on e-file; Black has no heavy pieces → no penalty for white.
+        // Black king e8: no pawn on e-file; White has queen → +20 for white.
+        // Net: +20.
+        assert!(ks > 0,
+            "fix: open black king file with enemy queen must produce positive score for white: {ks}");
+        let board_no_queen = board_from_fen("4k3/8/8/8/8/8/8/4K3 w - - 0 1");
+        let ks_no_queen = evaluate_king_safety(&board_no_queen, false);
+        assert!(ks > ks_no_queen,
+            "fix: adding enemy queen must increase penalty for open king file: with_queen={ks} without={ks_no_queen}");
     }
 }
