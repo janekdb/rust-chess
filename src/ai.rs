@@ -800,8 +800,17 @@ fn estimate_gain(mv: &Move, board: &shakmaty::Board) -> i32 {
             // recaptured.  Net gain = capture_val − attacker_val (can be negative).
             // This tightens delta pruning so losing captures are pruned rather than
             // searched, without affecting promotions or clearly winning captures.
+            //
+            // Fix #52: do NOT apply the recapture penalty when capture_val == 0
+            // (a quiet promotion with no capture).  The pawn is not actually
+            // captured when it promotes — it transforms — so no recapture is
+            // possible on the original pawn.  Before the fix, quiet queen promotions
+            // returned 700 cp (0 − 100 + 800) instead of 800 cp (0 + 800), causing
+            // delta pruning to incorrectly prune them under extreme score skews.
             let attacker_val = board.piece_at(*from).map(|p| piece_value(p.role)).unwrap_or(0);
-            let raw_gain = if attacker_val > capture_val {
+            let raw_gain = if capture_val == 0 {
+                0 // quiet promotion: no capture, no recapture risk
+            } else if attacker_val > capture_val {
                 capture_val - attacker_val
             } else {
                 capture_val
@@ -1128,9 +1137,15 @@ fn negamax_impl(
                     // deep EXACT entries from being evicted by shallow probes.
                     if beta.abs() <= TT_MATE_THRESHOLD {
                         let existing = &tt[tt_idx];
-                        if existing.hash != hash || depth >= existing.depth {
-                            // No best move known from null-move probe.
-                            tt[tt_idx] = TtEntry { hash, depth, score: beta, bound: TT_BOUND_LOWER,
+                        // Store at null_depth (fix #51): the proof was made by a
+                        // search at null_depth = depth-1-R, not at the full `depth`.
+                        // Using `depth` overstated the validity of the bound; future
+                        // probes at depth would trust it as if a full search ran,
+                        // causing spurious cutoffs.  Using null_depth ensures the
+                        // bound is only reused when the required depth is ≤ null_depth.
+                        if existing.hash != hash || null_depth >= existing.depth {
+                            tt[tt_idx] = TtEntry { hash, depth: null_depth, score: beta,
+                                                   bound: TT_BOUND_LOWER,
                                                    best_from: TT_NO_SQUARE, best_to: TT_NO_SQUARE };
                         }
                     }
@@ -6468,5 +6483,119 @@ mod tests {
         assert!(gain > 0,
             "fix #37: pawn takes rook (attacker ≤ victim) must have positive gain; got {}",
             gain);
+    }
+
+    // ── Fix #51: null-move TT stores null_depth not full depth ───────────────
+    //
+    // Bug: null-move pruning stored a TT_BOUND_LOWER entry with `depth` (the
+    // full remaining depth) even though the null-move search only ran at
+    // `null_depth = depth − 1 − NULL_MOVE_R`.  Future probes at `depth` would
+    // trust the bound as if a full-depth search had been done, causing spurious
+    // cutoffs in re-searches.
+    //
+    // Fix: store `null_depth` instead of `depth` so the bound is only reused
+    // when the probe's required depth ≤ null_depth.
+
+    /// Score must be stable across two identical searches at the same depth.
+    /// A spurious null-move TT cutoff from the first call could cause the
+    /// second call to short-circuit with an incorrect score, diverging the two.
+    #[test]
+    fn test_fix51_null_move_tt_score_stable() {
+        // Open position where null-move is likely to fire.
+        let pos = pos_from_fen("r1bqkbnr/pppp1ppp/2n5/4p3/4P3/5N2/PPPP1PPP/RNBQKB1R w KQkq - 2 3");
+        let mv1 = best_move(&pos, 4, &[]);
+        let mv2 = best_move(&pos, 4, &[]);
+        assert_eq!(mv1, mv2,
+            "fix #51: repeated searches must agree — null-move TT depth fix must not break consistency");
+    }
+
+    /// Blunder avoidance must be unaffected by the null-move TT depth fix.
+    #[test]
+    fn test_fix51_null_move_tt_avoids_blunder() {
+        let pos = pos_from_fen(BLUNDER_FEN);
+        let blunder = Move::Normal {
+            role: Role::Queen, from: Square::D3, to: Square::D5,
+            capture: Some(Role::Pawn), promotion: None,
+        };
+        let mv = best_move(&pos, 4, &[]);
+        assert!(mv.is_some());
+        assert_ne!(mv.unwrap(), blunder,
+            "fix #51: null-move TT depth fix must not cause a blunder");
+    }
+
+    /// Mate-in-one must still be found after the null-move TT depth fix.
+    #[test]
+    fn test_fix51_null_move_tt_mate_in_one() {
+        let pos = pos_from_fen(MATE_IN_ONE_FEN);
+        let mv = best_move(&pos, 3, &[]);
+        assert!(mv.is_some(), "engine must return a move");
+        let after = pos.clone().play(mv.unwrap()).expect("legal");
+        assert!(after.is_checkmate(),
+            "fix #51: null-move TT depth fix must not prevent finding mate-in-one");
+    }
+
+    // ── Fix #52: estimate_gain does not penalise quiet promotions ─────────────
+    //
+    // Bug: fix #37 applied the pessimistic recapture penalty whenever
+    // `attacker_val > capture_val`.  For a quiet promotion, `capture_val = 0`
+    // and `attacker_val = PAWN_VALUE = 100`, so the condition fired and
+    // `raw_gain = 0 − 100 = −100`.  A quiet queen promotion therefore returned
+    // 700 cp instead of 800 cp (the correct net gain), causing delta pruning to
+    // incorrectly prune it whenever `stand_pat + 900 ≤ alpha`.
+    //
+    // Fix: guard the pessimistic path with `capture_val > 0`; when there is no
+    // capture (`capture_val == 0`) the pawn transforms rather than being
+    // exchanged, so no recapture is possible on the original square.
+
+    /// `estimate_gain` must return exactly `QUEEN_VALUE − PAWN_VALUE = 800` for
+    /// a quiet queen promotion.  Before fix #52 it returned 700 because the
+    /// pessimistic recapture penalty subtracted the pawn value even though there
+    /// was no capture.
+    #[test]
+    fn test_fix52_estimate_gain_quiet_queen_promotion_is_800() {
+        // White pawn on a7 promoting to queen on a8, no capture.
+        let pos = pos_from_fen("8/P7/8/8/8/8/8/4K1k1 w - - 0 1");
+        let board = pos.board();
+        let mv = Move::Normal {
+            role: Role::Pawn, from: Square::A7, to: Square::A8,
+            capture: None, promotion: Some(Role::Queen),
+        };
+        let gain = estimate_gain(&mv, board);
+        let expected = piece_value(Role::Queen) - piece_value(Role::Pawn); // 900 - 100 = 800
+        assert_eq!(gain, expected,
+            "fix #52: quiet queen promotion must return {} cp; got {}", expected, gain);
+    }
+
+    /// Engine must choose the queening move (not be delta-pruned away from it)
+    /// in a simple promotion position where the pawn is one step from promotion.
+    #[test]
+    fn test_fix52_engine_plays_quiet_promotion() {
+        let pos = pos_from_fen("8/P7/8/8/8/8/8/4K1k1 w - - 0 1");
+        let mv = best_move(&pos, 3, &[]);
+        assert!(mv.is_some(), "engine must return a move");
+        let mv = mv.unwrap();
+        assert!(
+            matches!(mv, Move::Normal { to: Square::A8, promotion: Some(Role::Queen), .. }),
+            "fix #52: engine must play queen promotion; got {:?}", mv
+        );
+    }
+
+    /// A capture + promotion is still handled correctly: pawn takes rook with
+    /// queen promotion.  `attacker_val (100) ≤ capture_val (500)` so the
+    /// pessimistic path does not fire; gain = 500 + 800 = 1300.
+    #[test]
+    fn test_fix52_capture_promotion_gain_correct() {
+        // White pawn on a7 takes rook on b8 and promotes to queen.
+        let pos = pos_from_fen("1r6/P7/8/8/8/8/8/4K1k1 w - - 0 1");
+        let board = pos.board();
+        let mv = Move::Normal {
+            role: Role::Pawn, from: Square::A7, to: Square::B8,
+            capture: Some(Role::Rook), promotion: Some(Role::Queen),
+        };
+        let gain = estimate_gain(&mv, board);
+        // capture_val = 500, attacker = 100 ≤ 500 → raw_gain = 500; promo_bonus = 800.
+        let expected = piece_value(Role::Rook) + (piece_value(Role::Queen) - piece_value(Role::Pawn));
+        assert_eq!(gain, expected,
+            "fix #52: capture+promotion gain must be {}; got {}", expected, gain);
     }
 }
