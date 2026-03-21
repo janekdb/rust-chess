@@ -215,7 +215,7 @@ const TEMPO_BONUS: i32 = 10;
 ///
 /// Returns the score from White's absolute perspective (positive = good for
 /// White), consistent with `evaluate()`.
-fn evaluate_pawn_structure(board: &shakmaty::Board) -> i32 {
+fn evaluate_pawn_structure(board: &shakmaty::Board, turn: shakmaty::Color) -> i32 {
     // Collect (file_idx, rank_idx) for every pawn of each color, and king
     // positions (as i32 pairs) for the square-rule passed-pawn check.
     let mut white_pawns: Vec<(usize, usize)> = Vec::with_capacity(8);
@@ -265,17 +265,24 @@ fn evaluate_pawn_structure(board: &shakmaty::Board) -> i32 {
             // the pawn's queening square before the pawn promotes, the passer
             // is effectively unstoppable (no opposing pieces considered).
             //
-            // Chebyshev distance from the black king to the white queening
-            // square (wf, rank 7) must exceed the number of pawn moves needed
-            // for the pawn to be unambiguously beyond interception.
-            //
-            // We intentionally omit the turn-to-move adjustment so this holds
-            // regardless of whose turn the static evaluation is called on.
+            // Fix #53: the threshold depends on who moves next.  When White is
+            // to move the pawn goes first, so the king must reach the queening
+            // square in `pawn_moves` moves.  When Black is to move, Black gets
+            // a free king move before the pawn advances, so the threshold
+            // tightens by 1: king_dist must exceed `pawn_moves + 1` for the
+            // passer to be truly unstoppable.  Without this adjustment we
+            // incorrectly award the bonus when the king can intercept by using
+            // that free move.
             const UNSTOPPABLE_BONUS: i32 = 50;
             if let Some((bkf, bkr)) = black_king_pos {
                 let pawn_moves = (7 - wr as i32).max(0);
                 let king_dist = (bkf - wf as i32).abs().max(7 - bkr);
-                if king_dist > pawn_moves {
+                let threshold = if turn == shakmaty::Color::White {
+                    pawn_moves
+                } else {
+                    pawn_moves + 1
+                };
+                if king_dist > threshold {
                     score += UNSTOPPABLE_BONUS;
                 }
             }
@@ -301,11 +308,20 @@ fn evaluate_pawn_structure(board: &shakmaty::Board) -> i32 {
             // Square-rule bonus for black: if the white king cannot intercept
             // the black passer before it reaches rank 0 (promotion), apply an
             // extra bonus for black (subtracted from white's score).
+            //
+            // Fix #53 (symmetric): when Black is to move, the pawn advances
+            // first so threshold = pawn_moves.  When White is to move, White
+            // gets a free king move, so threshold = pawn_moves + 1.
             const UNSTOPPABLE_BONUS: i32 = 50;
             if let Some((wkf, wkr)) = white_king_pos {
                 let pawn_moves = (br as i32).max(0);
                 let king_dist = (wkf - bf as i32).abs().max(wkr);
-                if king_dist > pawn_moves {
+                let threshold = if turn == shakmaty::Color::Black {
+                    pawn_moves
+                } else {
+                    pawn_moves + 1
+                };
+                if king_dist > threshold {
                     score -= UNSTOPPABLE_BONUS;
                 }
             }
@@ -666,7 +682,7 @@ pub fn evaluate(pos: &Chess) -> i32 {
     if black_bishops >= 2 {
         score -= BISHOP_PAIR_BONUS;
     }
-    score += evaluate_pawn_structure(board);
+    score += evaluate_pawn_structure(board, pos.turn());
     score += evaluate_rook_files(board);
     score += evaluate_minor_mobility(board);
     score += evaluate_king_safety(board, endgame);
@@ -811,7 +827,15 @@ fn estimate_gain(mv: &Move, board: &shakmaty::Board) -> i32 {
             let raw_gain = if capture_val == 0 {
                 0 // quiet promotion: no capture, no recapture risk
             } else if attacker_val > capture_val {
-                capture_val - attacker_val
+                // Fix #54: clamp to 0 (break-even) instead of returning a negative
+                // gain.  The pessimistic SEE assumption (fix #37) is that we will be
+                // recaptured, giving net gain = capture_val − attacker_val.  But a
+                // negative estimate causes delta pruning to skip captures of
+                // undefended pieces when stand_pat ≈ alpha: e.g. Rxp where the pawn
+                // is undefended returned −400 cp, triggering the prune even though
+                // the true gain is +100 cp.  Clamping to 0 means "at worst we break
+                // even on a losing exchange" — a safe pessimistic floor.
+                0
             } else {
                 capture_val
             };
@@ -4203,8 +4227,8 @@ mod tests {
         let board_with = board_from_fen("4k3/8/3p4/8/4P3/8/8/4K3 w - - 0 1");
         // White: Ke1, pawn e4.  Black: Ke8.  No black pawns → e4 is NOT backward.
         let board_without = board_from_fen("4k3/8/8/8/4P3/8/8/4K3 w - - 0 1");
-        let score_with = evaluate_pawn_structure(&board_with);
-        let score_without = evaluate_pawn_structure(&board_without);
+        let score_with = evaluate_pawn_structure(&board_with, shakmaty::Color::White);
+        let score_without = evaluate_pawn_structure(&board_without, shakmaty::Color::White);
         assert!(
             score_with < score_without,
             "backward pawn should lower white's score: with={score_with} without={score_without}"
@@ -4220,8 +4244,8 @@ mod tests {
         let board_with = board_from_fen("4k3/8/8/4p3/8/3P4/8/4K3 w - - 0 1");
         // Black: pawn e5.  White: Ke1 only.  No white pawns attacking e4 → e5 not backward.
         let board_without = board_from_fen("4k3/8/8/4p3/8/8/8/4K3 w - - 0 1");
-        let score_with = evaluate_pawn_structure(&board_with);
-        let score_without = evaluate_pawn_structure(&board_without);
+        let score_with = evaluate_pawn_structure(&board_with, shakmaty::Color::White);
+        let score_without = evaluate_pawn_structure(&board_without, shakmaty::Color::White);
         // Black backward pawn is good for White, so score_with > score_without.
         assert!(
             score_with > score_without,
@@ -4239,8 +4263,8 @@ mod tests {
         let board = board_from_fen("4k3/8/5p2/8/3PP3/8/8/4K3 w - - 0 1");
         // Without the supporting d4 pawn, e4 would be backward.
         let board_no_support = board_from_fen("4k3/8/5p2/8/4P3/8/8/4K3 w - - 0 1");
-        let score_supported = evaluate_pawn_structure(&board);
-        let score_unsupported = evaluate_pawn_structure(&board_no_support);
+        let score_supported = evaluate_pawn_structure(&board, shakmaty::Color::White);
+        let score_unsupported = evaluate_pawn_structure(&board_no_support, shakmaty::Color::White);
         assert!(
             score_supported > score_unsupported,
             "supported pawn should not be penalised vs unsupported backward pawn: supported={score_supported} unsupported={score_unsupported}"
@@ -4258,7 +4282,7 @@ mod tests {
     #[test]
     fn test_backward_pawn_symmetric_is_zero() {
         let board = board_from_fen("4k3/8/3p4/5p2/2P5/4P3/8/4K3 w - - 0 1");
-        let score = evaluate_pawn_structure(&board);
+        let score = evaluate_pawn_structure(&board, shakmaty::Color::White);
         assert_eq!(score, 0, "symmetric backward pawns must net to zero: {score}");
     }
 
@@ -4465,8 +4489,8 @@ mod tests {
         // Ke8 (4,7) Chebyshev to e8 (4,7) = max(0,0) = 0 ≤ 2 → stoppable.
         // FEN: "4k3/8/4P3/8/8/8/8/7K w - - 0 1"  (Ke8=black, Kh1=white, Pe6)
         let board_near = board_from_fen("4k3/8/4P3/8/8/8/8/7K w - - 0 1");
-        let score_far  = evaluate_pawn_structure(&board_far);
-        let score_near = evaluate_pawn_structure(&board_near);
+        let score_far  = evaluate_pawn_structure(&board_far, shakmaty::Color::White);
+        let score_near = evaluate_pawn_structure(&board_near, shakmaty::Color::White);
         assert!(
             score_far > score_near,
             "unstoppable passer (king far) must score higher than stoppable: far={score_far} near={score_near}"
@@ -4484,8 +4508,8 @@ mod tests {
         // White pawn e4, black king a1 (far). Ka1 (0,0) to e8 (4,7) = max(4,7)=7 > 4 → unstoppable.
         // FEN: "8/8/8/8/4P3/8/8/k6K w - - 0 1"  (Ka1=black, Kh1=white, Pe4)
         let board_unstoppable = board_from_fen("8/8/8/8/4P3/8/8/k6K w - - 0 1");
-        let score_stop   = evaluate_pawn_structure(&board_stoppable);
-        let score_unstop = evaluate_pawn_structure(&board_unstoppable);
+        let score_stop   = evaluate_pawn_structure(&board_stoppable, shakmaty::Color::White);
+        let score_unstop = evaluate_pawn_structure(&board_unstoppable, shakmaty::Color::White);
         assert!(
             score_unstop > score_stop,
             "unstoppable passer must score higher: unstoppable={score_unstop} stoppable={score_stop}"
@@ -4502,13 +4526,155 @@ mod tests {
         // White king e2 (file=4, rank=1) Chebyshev to e1 (4,0) = max(0,1)=1 ≤ 2 → stoppable.
         // FEN: "k7/8/8/8/8/4p3/4K3/8 w - - 0 1"  (Ka8=black, Ke2=white, pe3)
         let board_near = board_from_fen("k7/8/8/8/8/4p3/4K3/8 w - - 0 1");
-        let score_far  = evaluate_pawn_structure(&board_far);
-        let score_near = evaluate_pawn_structure(&board_near);
+        let score_far  = evaluate_pawn_structure(&board_far, shakmaty::Color::White);
+        let score_near = evaluate_pawn_structure(&board_near, shakmaty::Color::White);
         // Unstoppable black passer is better for Black → more negative score from White's view.
         assert!(
             score_far < score_near,
             "unstoppable black passer (king far) must score lower (better for black): far={score_far} near={score_near}"
         );
+    }
+
+    // ── Fix #53: square-rule turn-awareness tests ─────────────────────────
+
+    /// When it is BLACK to move, the defending king gets a free move before the
+    /// white pawn advances.  A passer that appears unstoppable (king_dist >
+    /// pawn_moves) with white to move should NOT be awarded the bonus when black
+    /// moves first, because the king can close one square for free.
+    ///
+    /// White pawn e6 (rank 5, needs 2 moves).  Black king b6 (file=1, rank=5).
+    /// Chebyshev from b6 to e8: max(|1-4|, |5-7|) = max(3, 2) = 3.
+    /// White-to-move threshold = 2  →  3 > 2 → bonus awarded (correct).
+    /// Black-to-move threshold = 3  →  3 > 3 is FALSE → no bonus (correct).
+    #[test]
+    fn test_square_rule_turn_aware_no_bonus_when_black_to_move() {
+        // FEN: "8/8/1k2P3/8/8/8/8/7K w - - 0 1" (Kh1=white, Kb6=black, Pe6)
+        let board = board_from_fen("8/8/1k2P3/8/8/8/8/7K w - - 0 1");
+        // With white to move king_dist(3) > threshold(2) → bonus.
+        let score_wtm = evaluate_pawn_structure(&board, shakmaty::Color::White);
+        // With black to move king_dist(3) > threshold(3) is false → no bonus.
+        let score_btm = evaluate_pawn_structure(&board, shakmaty::Color::Black);
+        assert!(
+            score_wtm > score_btm,
+            "white-to-move should award unstoppable bonus, black-to-move should not: wtm={score_wtm} btm={score_btm}"
+        );
+    }
+
+    /// Mirror of the above for black's passer.
+    ///
+    /// Black pawn e3 (rank 2, needs 2 moves to e1).  White king b3 (file=1, rank=2).
+    /// Chebyshev from b3 to e1: max(|1-4|, |2-0|) = max(3, 2) = 3.
+    /// Black-to-move threshold = 2  →  3 > 2 → bonus awarded.
+    /// White-to-move threshold = 3  →  3 > 3 is FALSE → no bonus.
+    #[test]
+    fn test_square_rule_black_passer_turn_aware_no_bonus_when_white_to_move() {
+        // FEN: "k7/8/8/8/8/1K2p3/8/8 b - - 0 1" (Ka8=black, Kb3=white, pe3)
+        let board = board_from_fen("k7/8/8/8/8/1K2p3/8/8 b - - 0 1");
+        // Black-to-move: pawn goes first, threshold=2, king_dist=3 > 2 → bonus.
+        let score_btm = evaluate_pawn_structure(&board, shakmaty::Color::Black);
+        // White-to-move: king gets free move, threshold=3, king_dist=3 > 3 is false → no bonus.
+        let score_wtm = evaluate_pawn_structure(&board, shakmaty::Color::White);
+        // Black bonus means white's score goes down.
+        assert!(
+            score_btm < score_wtm,
+            "black-to-move should award black unstoppable bonus, white-to-move should not: btm={score_btm} wtm={score_wtm}"
+        );
+    }
+
+    /// Regression: a passer that is unstoppable regardless of turn (king far
+    /// away) must still receive the bonus whether white or black is to move.
+    ///
+    /// White pawn e6 (rank 5, needs 2 moves).  Black king a1 (far corner).
+    /// king_dist = max(4, 7) = 7.  Both thresholds (2 and 3) are below 7.
+    #[test]
+    fn test_square_rule_clearly_unstoppable_bonus_both_turns() {
+        // FEN: "8/8/4P3/8/8/8/8/k6K w - - 0 1" (Ka1=black, Kh1=white, Pe6)
+        let board = board_from_fen("8/8/4P3/8/8/8/8/k6K w - - 0 1");
+        let board_btm = board_from_fen("8/8/4P3/8/8/8/8/k6K b - - 0 1");
+        let score_wtm = evaluate_pawn_structure(&board, shakmaty::Color::White);
+        let score_btm = evaluate_pawn_structure(&board_btm, shakmaty::Color::Black);
+        // Both must include the UNSTOPPABLE_BONUS (50 cp difference vs no-bonus case).
+        // We simply confirm both score equally — the bonus fires in both cases.
+        assert_eq!(
+            score_wtm, score_btm,
+            "clearly unstoppable passer should score identically regardless of turn: wtm={score_wtm} btm={score_btm}"
+        );
+    }
+
+    // ── Fix #54: estimate_gain negative-clamp tests ────────────────────────
+
+    /// Before fix #54, `estimate_gain` for a queen capturing a pawn returned
+    /// 100 − 900 = −800, which caused delta pruning to skip the capture of an
+    /// undefended pawn even though the true gain is +100.  After the fix, the
+    /// estimate is 0 (break-even floor), never negative.
+    #[test]
+    fn test_estimate_gain_losing_capture_clamped_to_zero() {
+        // Board: white queen on d4, black pawn on e5 (undefended).
+        // Qxe5 is a losing capture in the SEE sense (Q > P) but the pawn is
+        // undefended so the *true* gain is +100.  estimate_gain must return ≥ 0.
+        use shakmaty::{Board, Color, Piece, Role, Square};
+        let mut board = Board::empty();
+        board.set_piece_at(Square::D4, Piece { color: Color::White, role: Role::Queen });
+        board.set_piece_at(Square::E5, Piece { color: Color::Black, role: Role::Pawn });
+        // Add kings to keep the board valid for piece_at lookups.
+        board.set_piece_at(Square::A1, Piece { color: Color::White, role: Role::King });
+        board.set_piece_at(Square::H8, Piece { color: Color::Black, role: Role::King });
+        let mv = Move::Normal {
+            role: Role::Queen,
+            from: Square::D4,
+            to: Square::E5,
+            capture: Some(Role::Pawn),
+            promotion: None,
+        };
+        let gain = estimate_gain(&mv, &board);
+        assert!(
+            gain >= 0,
+            "estimate_gain for queen×pawn must be ≥ 0 after fix #54, got {gain}"
+        );
+    }
+
+    /// A rook capturing an undefended pawn: before the fix the estimate was
+    /// 100 − 500 = −400, causing delta pruning to fire incorrectly.  After the
+    /// fix the estimate is 0.
+    #[test]
+    fn test_estimate_gain_rook_captures_pawn_not_negative() {
+        use shakmaty::{Board, Color, Piece, Role, Square};
+        let mut board = Board::empty();
+        board.set_piece_at(Square::A1, Piece { color: Color::White, role: Role::King });
+        board.set_piece_at(Square::H8, Piece { color: Color::Black, role: Role::King });
+        board.set_piece_at(Square::D1, Piece { color: Color::White, role: Role::Rook });
+        board.set_piece_at(Square::D7, Piece { color: Color::Black, role: Role::Pawn });
+        let mv = Move::Normal {
+            role: Role::Rook,
+            from: Square::D1,
+            to: Square::D7,
+            capture: Some(Role::Pawn),
+            promotion: None,
+        };
+        let gain = estimate_gain(&mv, &board);
+        assert_eq!(gain, 0, "rook×pawn estimate must be clamped to 0, got {gain}");
+    }
+
+    /// A clearly winning capture (knight takes queen) must still return the
+    /// full queen value — the clamp must not affect winning exchanges.
+    #[test]
+    fn test_estimate_gain_winning_capture_unaffected() {
+        use shakmaty::{Board, Color, Piece, Role, Square};
+        let mut board = Board::empty();
+        board.set_piece_at(Square::A1, Piece { color: Color::White, role: Role::King });
+        board.set_piece_at(Square::H8, Piece { color: Color::Black, role: Role::King });
+        board.set_piece_at(Square::C3, Piece { color: Color::White, role: Role::Knight });
+        board.set_piece_at(Square::D5, Piece { color: Color::Black, role: Role::Queen });
+        let mv = Move::Normal {
+            role: Role::Knight,
+            from: Square::C3,
+            to: Square::D5,
+            capture: Some(Role::Queen),
+            promotion: None,
+        };
+        let gain = estimate_gain(&mv, &board);
+        // Knight (320) < Queen (900) → winning capture branch → gain = 900.
+        assert_eq!(gain, QUEEN_VALUE, "knight×queen must return full queen value: got {gain}");
     }
 
     // ── O(1) repetition detection tests ───────────────────────────────────
@@ -6434,13 +6600,13 @@ mod tests {
             "fix #37: engine must not play a rook-takes-pawn when the pawn is defended by a queen");
     }
 
-    /// `estimate_gain` must return a negative value for a rook capturing a
-    /// pawn (pessimistic: assume rook is recaptured).  This directly tests the
-    /// fixed formula without going through the full search.
+    /// `estimate_gain` for a rook capturing a pawn must be clamped to 0 (fix
+    /// #54), not negative.  The old fix #37 formula `capture_val - attacker_val`
+    /// returned −400 for Rxp, causing delta pruning to incorrectly skip captures
+    /// of undefended pawns.  After fix #54 the floor is 0 (break-even).
     #[test]
-    fn test_fix37_estimate_gain_rook_takes_pawn_negative() {
-        use shakmaty::{fen::Fen, CastlingMode, Board};
-        // White Rd4 captures pawn on e5.  Attacker=500, victim=100 → gain = 100-500 = -400.
+    fn test_fix54_estimate_gain_rook_takes_pawn_clamped_to_zero() {
+        // White Rd4 captures pawn on e5.  Attacker=500 > victim=100 → clamped to 0.
         let pos = pos_from_fen("3qk3/8/8/4p3/3R4/8/8/4K3 w - - 0 1");
         let board = pos.board();
         let mv = Move::Normal {
@@ -6448,8 +6614,8 @@ mod tests {
             capture: Some(Role::Pawn), promotion: None,
         };
         let gain = estimate_gain(&mv, board);
-        assert!(gain < 0,
-            "fix #37: estimate_gain for Rxp (with no promo) must be negative when rook > pawn; got {}",
+        assert_eq!(gain, 0,
+            "fix #54: estimate_gain for Rxp must be clamped to 0 (not negative); got {}",
             gain);
     }
 
