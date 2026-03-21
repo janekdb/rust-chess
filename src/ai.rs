@@ -160,11 +160,14 @@ const KING_ENDGAME_PST: [i32; 64] = [
 /// `min(1730, 0) = 0 ≤ 500` → correctly flagged as endgame, activating the
 /// centralising king PST.
 ///
-/// A threshold of 500 cp (≈ rook + minor piece) correctly handles the common cases:
-/// - K+Q vs K   (min = 0   ≤ 500) → endgame ✓
-/// - K+R vs K   (min = 0   ≤ 500) → endgame ✓
-/// - K+Q vs K+R (min = 500 ≤ 500) → endgame ✓
-/// - K+Q vs K+Q (min = 900 > 500) → middlegame ✓
+/// A threshold of 700 cp (≈ queen, or rook + two minor pieces) correctly handles
+/// the common cases:
+/// - K+Q vs K       (min =   0 ≤ 700) → endgame ✓
+/// - K+R vs K       (min =   0 ≤ 700) → endgame ✓
+/// - K+Q vs K+R     (min = 500 ≤ 700) → endgame ✓
+/// - K+Q vs K+B+N   (min = 650 ≤ 700) → endgame ✓  (was wrong at 500)
+/// - K+Q vs K+Q     (min = 900 > 700) → middlegame ✓
+/// - K+R+B vs K+R+B (min = 830 > 700) → middlegame ✓
 fn is_endgame(pos: &Chess) -> bool {
     let board = pos.board();
     let white_material: i32 =
@@ -177,7 +180,7 @@ fn is_endgame(pos: &Chess) -> bool {
         + (board.bishops() & board.black()).count() as i32 * BISHOP_VALUE
         + (board.rooks()   & board.black()).count() as i32 * ROOK_VALUE
         + (board.queens()  & board.black()).count() as i32 * QUEEN_VALUE;
-    white_material.min(black_material) <= 500
+    white_material.min(black_material) <= 700
 }
 
 fn pst_bonus(role: Role, idx: usize, endgame: bool) -> i32 {
@@ -390,10 +393,15 @@ fn evaluate_pawn_structure(board: &shakmaty::Board, turn: shakmaty::Color) -> i3
         if has_support {
             continue;
         }
-        // (b) Stop square (wr+1) attacked by a black pawn on adjacent file at wr+2.
-        let stop_attacked = wr + 2 <= 7 && black_pawns.iter().any(|&(bf, br)| {
-            (bf as i32 - wf as i32).abs() == 1 && br == wr + 2
-        });
+        // (b) Stop square (wr+1) must be free of own pawns (a pawn in a doubled
+        //     stack is not truly backward — it cannot advance but has a blocker,
+        //     not a control problem), AND attacked by a black pawn at wr+2.
+        let stop_square_free = !white_pawns.iter().any(|&(f2, r2)| f2 == wf && r2 == wr + 1);
+        let stop_attacked = stop_square_free
+            && wr + 2 <= 7
+            && black_pawns.iter().any(|&(bf, br)| {
+                (bf as i32 - wf as i32).abs() == 1 && br == wr + 2
+            });
         if stop_attacked {
             score -= BACKWARD_PENALTY;
         }
@@ -407,10 +415,14 @@ fn evaluate_pawn_structure(board: &shakmaty::Board, turn: shakmaty::Color) -> i3
         if has_support {
             continue;
         }
-        // (b) Stop square (br-1) attacked by a white pawn on adjacent file at br-2.
-        let stop_attacked = br >= 2 && white_pawns.iter().any(|&(wf, wr)| {
-            (wf as i32 - bf as i32).abs() == 1 && wr + 2 == br
-        });
+        // (b) Stop square (br-1) must be free of own pawns, AND attacked by a
+        //     white pawn at br-2 (i.e. wr+2 == br ↔ wr == br-2).
+        let stop_square_free = !black_pawns.iter().any(|&(f2, r2)| f2 == bf && r2 == br - 1);
+        let stop_attacked = stop_square_free
+            && br >= 2
+            && white_pawns.iter().any(|&(wf, wr)| {
+                (wf as i32 - bf as i32).abs() == 1 && wr + 2 == br
+            });
         if stop_attacked {
             score += BACKWARD_PENALTY;
         }
@@ -2970,16 +2982,14 @@ mod tests {
     #[test]
     fn test_bishop_pair_both_sides_nets_zero_bonus() {
         // Both sides have the bishop pair — bonuses cancel: net contribution = 0.
-        // Na1/Na8 added symmetrically so both positions share the same is_endgame
-        // result (min material = 960 > 500 → middlegame), preventing king-PST
-        // asymmetry that would skew the comparison.
-        // White: Na1, Bc1, Bf1, Ke1. Black: Na8, Bc8, Bf8, kh8.
-        let both_pair = pos_from_fen("n1b2b1k/8/8/8/8/8/8/N1B1KB2 w - - 0 1");
-        // White: Na1, Bc1, Ke1. Black: Na8, Bc8, kh8. Neither has bishop pair.
-        // min material = 640 > 500 → middlegame, same phase as both_pair.
-        let neither_pair = pos_from_fen("n1b4k/8/8/8/8/8/8/N1B1K3 w - - 0 1");
-        // Extra pieces are Na1/Na8 (mirrors) and Bf1/Bf8 (mirrors) → all cancel.
-        // Bishop pair bonuses also cancel (+30 white, −30 black = 0 net).
+        // Using B+B+K vs B+B+K: min(660,660)=660 ≤ 700 → endgame under the new
+        // threshold, so the same KING_ENDGAME_PST is used in both positions.
+        // White: Bc1, Bf1, Ke1.  Black: Bc8, Bf8, Kh8.
+        let both_pair = pos_from_fen("2b2b1k/8/8/8/8/8/8/2B1KB2 w - - 0 1");
+        // White: Bc1, Ke1.  Black: Bc8, Kh8.  Neither has bishop pair.
+        // min(330,330)=330 ≤ 700 → endgame, same phase as both_pair.
+        // Bf1/Bf8 removed: PST+mobility cancel; bishop pair bonuses also cancel.
+        let neither_pair = pos_from_fen("2b4k/8/8/8/8/8/8/2B1K3 w - - 0 1");
         assert_eq!(
             evaluate(&both_pair),
             evaluate(&neither_pair),
@@ -7694,5 +7704,98 @@ mod tests {
         let mv1 = best_move(&pos, 3, &[]);
         let mv2 = best_move(&pos, 3, &[]);
         assert_eq!(mv1, mv2, "fix #57b: best_move must return the same move on repeated calls (determinism)");
+    }
+
+    // ── Fix A: backward pawn stop-square guard ─────────────────────────────
+
+    /// Regression: a doubled white pawn (e3 + e4) where the rear pawn (e3) has
+    /// its stop square (e4) occupied by a friendly pawn must NOT be counted as
+    /// backward, even when Black's d5 pawn satisfies the stop-square-attacked
+    /// criterion for e3 (d5 is at rank 4 = wr+2 for e3 at rank 2).
+    ///
+    /// Expected score components after fix:
+    ///   doubled e-file:            -15
+    ///   isolated e-file × 2:       -40
+    ///   e3 NOT backward (fix A):     0  (before fix: -15)
+    ///   e4 not backward (d5 too far): 0
+    ///   black d5 isolated:          +20
+    ///   black d5 backward for black:+15  (white e3 at wr=2 attacks d4=stop of d5)
+    ///   Total:                      -20  (before fix would be -35)
+    #[test]
+    fn test_backward_pawn_doubled_stack_not_penalised() {
+        // White e3+e4 (doubled), Black d5.  d5 is at rank index 4 = wr+2 for
+        // e3 (wr=2), so before the fix e3 was incorrectly backward.
+        let board = board_from_fen("4k3/8/8/3p4/4P3/4P3/8/4K3 w - - 0 1");
+        let score = evaluate_pawn_structure(&board, shakmaty::Color::White);
+        assert_eq!(score, -20,
+            "fix A: doubled-stack rear pawn must not incur backward penalty (expected -20, got {score})");
+    }
+
+    /// Regression for black: a doubled black pawn (e6 + e5) where the rear
+    /// pawn (e6) has its stop square (e5) occupied by a friendly pawn must NOT
+    /// be counted as backward.
+    ///
+    /// Expected score components after fix (from white's perspective):
+    ///   black doubled e-file:       +15
+    ///   black isolated e-file × 2:  +40
+    ///   e6 NOT backward (fix A):      0  (before fix: +15)
+    ///   e5 not backward (d4 too far): 0
+    ///   white d4 isolated:           -20
+    ///   white d4 backward for white: -15  (black e6 at br=5 attacks d5=stop of d4)
+    ///   Total:                       +20  (before fix would be +35)
+    #[test]
+    fn test_backward_pawn_black_doubled_stack_not_penalised() {
+        // Black e5+e6 (doubled), White d4.  d4 is at rank index 3 (wr+2=5=br
+        // for e6), so before fix e6 was incorrectly backward for black.
+        let board = board_from_fen("4k3/8/4p3/4p3/3P4/8/8/4K3 w - - 0 1");
+        let score = evaluate_pawn_structure(&board, shakmaty::Color::White);
+        assert_eq!(score, 20,
+            "fix A (black): doubled-stack rear pawn must not incur backward penalty (expected +20, got {score})");
+    }
+
+    /// Sanity: when the stop square IS free and attacked, the backward penalty
+    /// is still applied (fix A must not suppress legitimate backward pawns).
+    #[test]
+    fn test_backward_pawn_free_stop_square_still_penalised() {
+        // White pawn e4 only (stop square e5 is free), black pawn d6 attacks e5.
+        // e4 is genuinely backward → penalty should be applied.
+        let board_backward = board_from_fen("4k3/8/3p4/8/4P3/8/8/4K3 w - - 0 1");
+        // White pawn e4 only, NO black pawn → not backward.
+        let board_clean    = board_from_fen("4k3/8/8/8/4P3/8/8/4K3 w - - 0 1");
+        let score_backward = evaluate_pawn_structure(&board_backward, shakmaty::Color::White);
+        let score_clean    = evaluate_pawn_structure(&board_clean,    shakmaty::Color::White);
+        assert!(
+            score_backward < score_clean,
+            "fix A sanity: free-stop-square backward pawn still penalised: backward={score_backward} clean={score_clean}"
+        );
+    }
+
+    // ── Fix B: is_endgame threshold 500 → 700 ─────────────────────────────
+
+    /// K+Q vs K+B+N: weaker side has 650 cp (bishop=330 + knight=320).
+    /// With threshold 500 this was classified as middlegame; with 700 it is
+    /// correctly classified as endgame so the centralising KING_ENDGAME_PST is used.
+    #[test]
+    fn test_is_endgame_queen_vs_bishop_knight_is_endgame() {
+        // White: K+Q.  Black: K+B+N.  min(900, 650) = 650 ≤ 700 → endgame.
+        let pos = pos_from_fen("4k1nb/8/8/8/8/8/8/4KQ2 w - - 0 1");
+        assert!(is_endgame(&pos),
+            "fix B: K+Q vs K+B+N (min=650) must be classified as endgame with threshold 700");
+    }
+
+    /// K+Q vs K+Q: min(900,900)=900 > 700 → must remain middlegame (no regression).
+    #[test]
+    fn test_is_endgame_fixb_queen_vs_queen_still_middlegame() {
+        let pos = pos_from_fen("3qk3/8/8/8/8/8/8/3QK3 w - - 0 1");
+        assert!(!is_endgame(&pos),
+            "fix B: K+Q vs K+Q (min=900) must still be middlegame");
+    }
+
+    /// K+Q vs K+R: min(900,500)=500 ≤ 700 → endgame.  Must still pass (no regression).
+    #[test]
+    fn test_is_endgame_fixb_queen_vs_rook_still_endgame() {
+        let pos = pos_from_fen("3rk3/8/8/8/8/8/8/3QK3 w - - 0 1");
+        assert!(is_endgame(&pos),
+            "fix B: K+Q vs K+R (min=500) must still be endgame");
     }
 }
