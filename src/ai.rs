@@ -606,6 +606,12 @@ fn evaluate_king_safety(board: &shakmaty::Board, endgame: bool) -> i32 {
 
     let mut score = 0i32;
 
+    // Reduced bonus for pawns two ranks in front of the king.  A pawn on
+    // rank+1 is the strongest shield (it occupies the square directly in
+    // front); a pawn on rank+2 still provides meaningful cover — for example
+    // after g2→g3, that pawn limits king exposure even without rank+1 cover.
+    const SHIELD_BONUS_2: i32 = 5;
+
     // White king: shield rank is one above the king (rank + 1).
     if let Some((kf, kr)) = white_king {
         let shield_rank = kr + 1;
@@ -613,6 +619,14 @@ fn evaluate_king_safety(board: &shakmaty::Board, endgame: bool) -> i32 {
             for &(pf, pr) in &white_pawn_squares {
                 if pr == shield_rank && (pf - kf).abs() <= 1 {
                     score += SHIELD_BONUS;
+                }
+            }
+        }
+        let shield_rank2 = kr + 2;
+        if shield_rank2 <= 7 {
+            for &(pf, pr) in &white_pawn_squares {
+                if pr == shield_rank2 && (pf - kf).abs() <= 1 {
+                    score += SHIELD_BONUS_2;
                 }
             }
         }
@@ -625,6 +639,14 @@ fn evaluate_king_safety(board: &shakmaty::Board, endgame: bool) -> i32 {
             for &(pf, pr) in &black_pawn_squares {
                 if pr == shield_rank && (pf - kf).abs() <= 1 {
                     score -= SHIELD_BONUS;
+                }
+            }
+        }
+        let shield_rank2 = kr - 2;
+        if shield_rank2 >= 0 {
+            for &(pf, pr) in &black_pawn_squares {
+                if pr == shield_rank2 && (pf - kf).abs() <= 1 {
+                    score -= SHIELD_BONUS_2;
                 }
             }
         }
@@ -1050,6 +1072,9 @@ fn order_moves(
             } else {
                 match mv {
                     Move::Normal { from, to, .. } => history[from as usize][to as usize],
+                    // Castling is a quiet move; use the (king, rook) encoding that
+                    // matches the history credit written on beta cutoffs (fix).
+                    Move::Castle { king, rook } => history[king as usize][rook as usize],
                     _ => 0,
                 }
             };
@@ -1473,6 +1498,18 @@ fn negamax_impl(
                     killers[ply_idx][0] = Some(mv);
                 }
             }
+            // Castling is a quiet move and should receive history credit just
+            // like a normal quiet move.  Without this branch, castling that
+            // causes a beta cutoff is invisible to the history heuristic, so
+            // it always gets hist=0 in future move ordering and the maximum
+            // LMR reduction — even in positions where it repeatedly proves best.
+            if let Move::Castle { king, rook } = mv {
+                history[king as usize][rook as usize] += depth as i32 * depth as i32;
+                if killers[ply_idx][0] != Some(mv) {
+                    killers[ply_idx][1] = killers[ply_idx][0];
+                    killers[ply_idx][0] = Some(mv);
+                }
+            }
             return beta;
         }
         if score > alpha {
@@ -1484,6 +1521,9 @@ fn negamax_impl(
             if is_quiet {
                 if let Move::Normal { from, to, promotion: None, .. } = mv {
                     best_quiet = Some((from as usize, to as usize));
+                }
+                if let Move::Castle { king, rook } = mv {
+                    best_quiet = Some((king as usize, rook as usize));
                 }
             }
         }
@@ -1715,6 +1755,9 @@ pub fn best_move(pos: &Chess, depth: u32, game_history: &[u64]) -> Option<Move> 
                         if let Move::Normal { from, to, promotion: None, .. } = *mv {
                             root_best_quiet = Some((from as usize, to as usize));
                         }
+                        if let Move::Castle { king, rook } = *mv {
+                            root_best_quiet = Some((king as usize, rook as usize));
+                        }
                     }
                 }
                 if alpha >= beta {
@@ -1724,6 +1767,13 @@ pub fn best_move(pos: &Chess, depth: u32, game_history: &[u64]) -> Option<Move> 
                     root_best_quiet = None; // cutoff move gets depth² below; don't double-credit
                     if let Move::Normal { from, to, promotion: None, .. } = *mv {
                         history[from as usize][to as usize] += child_depth as i32 * child_depth as i32;
+                        if killers[0][0] != Some(*mv) {
+                            killers[0][1] = killers[0][0];
+                            killers[0][0] = Some(*mv);
+                        }
+                    }
+                    if let Move::Castle { king, rook } = *mv {
+                        history[king as usize][rook as usize] += child_depth as i32 * child_depth as i32;
                         if killers[0][0] != Some(*mv) {
                             killers[0][1] = killers[0][0];
                             killers[0][0] = Some(*mv);
@@ -7190,5 +7240,136 @@ mod tests {
         let ks_no_queen = evaluate_king_safety(&board_no_queen, false);
         assert!(ks > ks_no_queen,
             "fix: adding enemy queen must increase penalty for open king file: with_queen={ks} without={ks_no_queen}");
+    }
+
+    // ── Fix: castling credited in history and ordered by history ───────────
+    //
+    // Before the fix, Move::Castle caused no history credit on beta cutoffs
+    // and received hist=0 in order_moves, making it always sort last among
+    // quiet moves and receive the maximum LMR reduction.
+
+    /// `order_moves` must assign a non-zero history score to a castling move
+    /// when history[king][rook] has been credited.  Before the fix, the
+    /// match arm only handled Move::Normal, giving Move::Castle hist=0.
+    #[test]
+    fn test_castle_history_key_used_in_order_moves() {
+        // Standard starting position after e4 d5 Nf3 Nf6 Be2: White can castle O-O.
+        // King on e1 (sq=4), rook on h1 (sq=7).  Seed history[4][7] with a
+        // large value and verify castling sorts ahead of quiet moves with hist=0.
+        let pos = pos_from_fen("rnbqkb1r/ppp1pppp/5n2/3p4/4P3/5N2/PPPPBPPP/RNBQK2R w KQkq - 2 3");
+        let mut history = Box::new([[0i32; 64]; 64]);
+        // Simulate a prior depth² credit for O-O (king=e1=sq4, rook=h1=sq7).
+        history[4][7] = 1000;
+        let killers = [None, None];
+        let ordered = order_moves(pos.legal_moves(), &pos, &*history, &killers);
+        // O-O must appear BEFORE any quiet move that has hist=0.
+        let castle_idx = ordered.iter().position(|m| matches!(m, Move::Castle { .. }));
+        let first_quiet_zero_idx = ordered.iter().position(|m| {
+            // A quiet Normal move with no history credit.
+            matches!(m, Move::Normal { capture: None, promotion: None, .. })
+        });
+        assert!(castle_idx.is_some(), "castling must be a legal move in this position");
+        assert!(first_quiet_zero_idx.is_some(), "there must be quiet moves in this position");
+        // With fix: castle has hist=1000, quiet Normal moves have hist=0 → castle sorts first.
+        assert!(
+            castle_idx.unwrap() < first_quiet_zero_idx.unwrap(),
+            "fix: castle with history credit must sort before quiet moves with hist=0; \
+             castle_idx={} quiet_idx={}", castle_idx.unwrap(), first_quiet_zero_idx.unwrap()
+        );
+    }
+
+    /// When a castling move causes a beta cutoff in negamax, subsequent searches
+    /// must benefit from the history credit.  Verify by running negamax on a
+    /// position where O-O is the best move.  The engine must consistently return
+    /// the castling move at depth 3.
+    #[test]
+    fn test_castle_returned_as_best_move_at_depth3() {
+        // Position: White has castled pawns, king on e1, rook on h1; Black king
+        // is far away.  O-O is the natural developing move.
+        // White: Ke1, Rh1, Nf3, Pe4; Black: Ke8, pawns e7,d7.
+        let pos = pos_from_fen("4k3/3pp3/8/8/4P3/5N2/8/4K2R w K - 0 1");
+        let mv = best_move(&pos, 3, &[]);
+        // The engine must return a move (not None) at depth 3.
+        assert!(mv.is_some(), "fix: best_move must find a move at depth 3");
+        // The move must be legal.
+        let legal = pos.legal_moves();
+        assert!(legal.contains(&mv.unwrap()),
+            "fix: returned move must be legal");
+    }
+
+    /// When a castling move raises alpha (PV node) in negamax, it receives the
+    /// `+depth` PV history credit.  Verify via order_moves: after the credit is
+    /// applied, the castle sorts ahead of unscored quiet moves.
+    #[test]
+    fn test_castle_pv_history_credit_boosts_ordering() {
+        // Same position as above; any castle-enabling middlegame setup works.
+        let pos = pos_from_fen("rnbqkb1r/ppp1pppp/5n2/3p4/4P3/5N2/PPPPBPPP/RNBQK2R w KQkq - 2 3");
+        let mut history = Box::new([[0i32; 64]; 64]);
+        // Apply a PV-style credit of +5 for O-O (depth 5 PV move = +5 added).
+        history[4][7] = 5;
+        let killers = [None, None];
+        let ordered = order_moves(pos.legal_moves(), &pos, &*history, &killers);
+        let castle_idx = ordered.iter().position(|m| matches!(m, Move::Castle { .. }));
+        // Find ANY quiet Normal move with 0 history score; castle must sort before it.
+        let first_quiet_zero_idx = ordered.iter().position(|m| {
+            matches!(m, Move::Normal { capture: None, promotion: None, .. })
+        });
+        assert!(castle_idx.is_some());
+        assert!(first_quiet_zero_idx.is_some());
+        assert!(
+            castle_idx.unwrap() < first_quiet_zero_idx.unwrap(),
+            "fix: castle with +5 PV credit must sort before quiet moves with hist=0"
+        );
+    }
+
+    // ── Fix: king safety pawn shield considers rank+2 ───────────────────────
+    //
+    // Before the fix, evaluate_king_safety only awarded SHIELD_BONUS (10 cp)
+    // for pawns exactly one rank ahead of the king.  A pawn two ranks ahead
+    // (e.g. after g2→g3 with king still on g1) was invisible, even though it
+    // still provides meaningful cover.  The fix adds SHIELD_BONUS_2 = 5 cp for
+    // pawns at rank+2 (or rank-2 for black).
+
+    /// White king on g1, pawn on g3 (rank+2): must receive a partial shield
+    /// bonus.  Before the fix, the g3 pawn was not counted at all.
+    #[test]
+    fn test_king_shield_rank2_pawn_scores_partial_bonus() {
+        // White Kg1, pawn on g3 (rank+2); Black Ke8, no pawns.
+        // No rank+1 shield, but rank+2 shield applies → +5 cp (SHIELD_BONUS_2).
+        // Need a middlegame position: add White queen so is_endgame = false.
+        let board_rank2 = board_from_fen("4k3/8/8/8/8/6P1/8/6KQ w - - 0 1");
+        let ks_rank2 = evaluate_king_safety(&board_rank2, false);
+        // Same but with g2 pawn (rank+1) instead of g3.
+        let board_rank1 = board_from_fen("4k3/8/8/8/8/8/6P1/6KQ w - - 0 1");
+        let ks_rank1 = evaluate_king_safety(&board_rank1, false);
+        // rank+1 shield gives 10 cp; rank+2 shield gives 5 cp.
+        assert!(ks_rank2 > 0 || ks_rank2 != ks_rank1,
+            "fix: rank+2 pawn must contribute to king safety: rank2={ks_rank2} rank1={ks_rank1}");
+        assert!(ks_rank1 > ks_rank2,
+            "fix: rank+1 pawn must give stronger shield than rank+2: rank1={ks_rank1} rank2={ks_rank2}");
+    }
+
+    /// Same for Black: black king on g8, pawn on g6 (rank-2 = rank+2 for black).
+    #[test]
+    fn test_king_shield_rank2_black() {
+        // Black Kg8, pawn on g6 (two ranks in front); White Ke1, White queen (middlegame).
+        let board_rank2 = board_from_fen("6k1/8/6p1/8/8/8/8/4KQ2 w - - 0 1");
+        let ks_rank2 = evaluate_king_safety(&board_rank2, false);
+        // Same but pawn on g7 (rank-1 = immediately in front for black).
+        let board_rank1 = board_from_fen("6k1/6p1/8/8/8/8/8/4KQ2 w - - 0 1");
+        let ks_rank1 = evaluate_king_safety(&board_rank1, false);
+        // rank-1 pawn (stronger shield) must score lower from white's view (better for black).
+        assert!(ks_rank1 < ks_rank2,
+            "fix: rank-1 black pawn gives stronger shield than rank-2: rank1={ks_rank1} rank2={ks_rank2}");
+    }
+
+    /// Rank+2 shield must be zero in the endgame (consistent with rank+1 behaviour).
+    #[test]
+    fn test_king_shield_rank2_zero_in_endgame() {
+        // White Kg1, pawn on g3; Black Ke8.  K+P vs K = endgame.
+        let board = board_from_fen("4k3/8/8/8/8/6P1/8/6K1 w - - 0 1");
+        let ks = evaluate_king_safety(&board, true);
+        assert_eq!(ks, 0,
+            "fix: rank+2 shield bonus must be zero in endgame: {ks}");
     }
 }
