@@ -646,7 +646,17 @@ fn evaluate_king_safety(board: &shakmaty::Board, endgame: bool) -> i32 {
         if shield_rank2 <= 7 {
             for &(pf, pr) in &white_pawn_squares {
                 if pr == shield_rank2 && (pf - kf).abs() <= 1 {
-                    score += SHIELD_BONUS_2;
+                    // Only award the secondary bonus when the primary-shield square
+                    // (same file, rank+1) is vacant.  If a pawn already occupies
+                    // rank+1 on this file it provides the primary shield; the rank+2
+                    // pawn is blocked behind it and adds no extra coverage.  Granting
+                    // both bonuses in a doubled-pawn stack inflates king safety for a
+                    // configuration that is actually weaker (doubled pawns).
+                    let primary_present = white_pawn_squares.iter()
+                        .any(|&(pf2, pr2)| pf2 == pf && pr2 == shield_rank);
+                    if !primary_present {
+                        score += SHIELD_BONUS_2;
+                    }
                 }
             }
         }
@@ -666,7 +676,13 @@ fn evaluate_king_safety(board: &shakmaty::Board, endgame: bool) -> i32 {
         if shield_rank2 >= 0 {
             for &(pf, pr) in &black_pawn_squares {
                 if pr == shield_rank2 && (pf - kf).abs() <= 1 {
-                    score -= SHIELD_BONUS_2;
+                    // Same guard as white: only give secondary bonus when the primary
+                    // shield square (same file, rank-1) is vacant for black.
+                    let primary_present = black_pawn_squares.iter()
+                        .any(|&(pf2, pr2)| pf2 == pf && pr2 == shield_rank);
+                    if !primary_present {
+                        score -= SHIELD_BONUS_2;
+                    }
                 }
             }
         }
@@ -804,7 +820,18 @@ fn quiescence_impl(
             tt_best_promo = e.best_promo;
             // Depth check always passes (all depths ≥ QS_DEPTH = 0).
             match e.bound {
-                TT_BOUND_EXACT => return e.score,
+                // Clamp the exact score to the current window (fail-hard convention).
+                // If the stored exact score is outside [alpha, beta] — which happens
+                // when aspiration windows or recursive calls use a narrower window than
+                // the one that produced the TT entry — returning it unclamped sends an
+                // out-of-window value to the parent, where it can incorrectly update
+                // alpha or trigger a spurious beta cutoff.  Clamping is the standard
+                // fail-hard fix used by most production engines (e.g. Stockfish).
+                TT_BOUND_EXACT => {
+                    if e.score >= beta  { return beta;  }
+                    if e.score <= alpha { return alpha; }
+                    return e.score;
+                }
                 TT_BOUND_LOWER => {
                     if e.score >= beta  { return beta;  }
                     if e.score > alpha  { alpha = e.score; }
@@ -1240,7 +1267,17 @@ fn negamax_impl(
             tt_best_promo = e.best_promo;
             if e.depth >= depth {
                 match e.bound {
-                    TT_BOUND_EXACT => return e.score,
+                    // Clamp the exact score to the current window (fail-hard convention).
+                    // The stored EXACT score was computed with a (possibly wider) window.
+                    // Returning it unclamped when it lies outside the current [alpha, beta]
+                    // propagates an out-of-window value to the parent, which can raise alpha
+                    // to a value below the stored score, corrupting subsequent sibling
+                    // searches.  The same clamp is applied in quiescence_impl.
+                    TT_BOUND_EXACT => {
+                        if e.score >= beta  { return beta;  }
+                        if e.score <= alpha { return alpha; }
+                        return e.score;
+                    }
                     // Fail-hard: return the window bound, not e.score.
                     TT_BOUND_LOWER => {
                         if e.score >= beta  { return beta;  }
@@ -7797,5 +7834,133 @@ mod tests {
         let pos = pos_from_fen("3rk3/8/8/8/8/8/8/3QK3 w - - 0 1");
         assert!(is_endgame(&pos),
             "fix B: K+Q vs K+R (min=500) must still be endgame");
+    }
+
+    // ── TT EXACT clamping (Cycle 3 Fix A) ─────────────────────────────────
+
+    /// An EXACT TT entry whose score is above beta should behave as a fail-high:
+    /// negamax must return beta, not the raw stored score.
+    ///
+    /// Set up: force a pre-computed TT entry (via a first negamax call that
+    /// finds the exact score) then re-search the same position with a tighter
+    /// window where the stored score exceeds beta.  The result must be clamped.
+    #[test]
+    fn test_tt_exact_clamp_fail_high() {
+        // Starting position: well-studied, negamax returns a consistent exact score.
+        let pos = pos_from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1");
+        // First call: find the "true" score at depth 3 (full window).
+        let full_score = negamax(&pos, 3, -30001, 30001);
+        // If the score is positive (white is ahead), search with a beta just below
+        // the true score.  The TT entry from the first call has the exact score.
+        // With clamping: result must be <= the requested beta.
+        // Without clamping: result would be the raw TT score (above beta), violating
+        // fail-hard convention and corrupting the parent's alpha.
+        if full_score > 0 {
+            let tight_beta = full_score - 1; // ask "is score < full_score?"
+            let clamped = negamax(&pos, 3, -30001, tight_beta);
+            assert!(clamped <= tight_beta,
+                "fix A: TT EXACT score must be clamped to beta when score > beta: \
+                 score={full_score} beta={tight_beta} returned={clamped}");
+        } else if full_score < 0 {
+            let tight_alpha = full_score + 1;
+            let clamped = negamax(&pos, 3, tight_alpha, 30001);
+            assert!(clamped >= tight_alpha,
+                "fix A: TT EXACT score must be clamped to alpha when score < alpha: \
+                 score={full_score} alpha={tight_alpha} returned={clamped}");
+        }
+        // score == 0: draw by definition, nothing to clamp.
+    }
+
+    /// TT EXACT clamping must not disturb results inside the window.
+    ///
+    /// If the stored exact score is within [alpha, beta], the clamped value
+    /// equals the stored value — the fix is a no-op in the normal case.
+    #[test]
+    fn test_tt_exact_clamp_noop_inside_window() {
+        let pos = pos_from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq e3 0 1");
+        let score1 = negamax(&pos, 3, -30001, 30001);
+        // Second call with same full window: TT hit, score is within window.
+        let score2 = negamax(&pos, 3, -30001, 30001);
+        assert_eq!(score1, score2,
+            "fix A: TT EXACT within window must return the stored score unchanged: \
+             first={score1} second={score2}");
+    }
+
+    /// TT EXACT clamping applies in quiescence too: a stored score outside the
+    /// quiescence window must be clamped, not returned raw.
+    #[test]
+    fn test_tt_exact_clamp_in_quiescence() {
+        let pos = pos_from_fen("r1bqkb1r/pppp1ppp/2n2n2/4p3/2B1P3/5N2/PPPP1PPP/RNBQK2R w KQkq - 4 4");
+        let history = [[0i32; 64]; 64];
+        let full_score = quiescence(&pos, -30001, 30001, 4, &history);
+        // Probe with a window that excludes the exact score.
+        if full_score > 0 {
+            let tight_beta = full_score - 1;
+            let clamped = quiescence(&pos, -30001, tight_beta, 4, &history);
+            assert!(clamped <= tight_beta,
+                "fix A: quiescence TT EXACT must be clamped to beta: \
+                 score={full_score} beta={tight_beta} returned={clamped}");
+        } else if full_score < 0 {
+            let tight_alpha = full_score + 1;
+            let clamped = quiescence(&pos, tight_alpha, 30001, 4, &history);
+            assert!(clamped >= tight_alpha,
+                "fix A: quiescence TT EXACT must be clamped to alpha: \
+                 score={full_score} alpha={tight_alpha} returned={clamped}");
+        }
+    }
+
+    // ── King-safety secondary shield fix (Cycle 3 Fix B) ──────────────────
+
+    /// When a white doubled pawn occupies both rank+1 and rank+2 in front of the
+    /// king (same file), the rank+2 pawn must NOT earn SHIELD_BONUS_2 — the
+    /// rank+1 pawn already provides primary shielding for that file.
+    ///
+    /// Before fix: doubled stack gave +10 (rank+1) + +5 (rank+2) = +15 per file.
+    /// After fix: doubled stack gives only +10 (rank+1); +5 bonus only applies
+    /// when the primary-shield square is vacant on that file.
+    #[test]
+    fn test_shield_bonus_2_not_given_for_doubled_pawn() {
+        // King on g1, doubled pawns on g2+g3.
+        let board_doubled = board_from_fen("4k3/8/8/8/8/6P1/6P1/6K1 w - - 0 1");
+        // King on g1, single pawn on g2 (primary shield).
+        let board_single  = board_from_fen("4k3/8/8/8/8/8/6P1/6K1 w - - 0 1");
+        let ks_doubled = evaluate_king_safety(&board_doubled, false);
+        let ks_single  = evaluate_king_safety(&board_single,  false);
+        // After fix: doubled gives same shield score as single (g3 adds no bonus).
+        assert_eq!(ks_doubled, ks_single,
+            "fix B: doubled-stack rank+2 pawn must not earn secondary shield bonus: \
+             doubled={ks_doubled} single={ks_single}");
+    }
+
+    /// Regression: when the primary-shield square IS vacant (pawn moved to rank+2),
+    /// SHIELD_BONUS_2 must still apply.  The fix must not suppress the bonus in
+    /// the legitimate "advanced pawn" case.
+    #[test]
+    fn test_shield_bonus_2_still_given_when_primary_absent() {
+        // King on g1, pawn on g3 only (g2 is empty — pawn has advanced).
+        let board_advanced = board_from_fen("4k3/8/8/8/8/6P1/8/6K1 w - - 0 1");
+        // King on g1, no pawns (zero shield).
+        let board_bare     = board_from_fen("4k3/8/8/8/8/8/8/6K1 w - - 0 1");
+        let ks_advanced = evaluate_king_safety(&board_advanced, false);
+        let ks_bare     = evaluate_king_safety(&board_bare,     false);
+        assert!(ks_advanced > ks_bare,
+            "fix B: pawn on rank+2 with vacant rank+1 must still earn SHIELD_BONUS_2: \
+             advanced={ks_advanced} bare={ks_bare}");
+    }
+
+    /// Same fix for black: doubled black pawn in front of black king must not
+    /// earn both SHIELD_BONUS and SHIELD_BONUS_2 for the same file.
+    #[test]
+    fn test_shield_bonus_2_not_given_for_black_doubled_pawn() {
+        // Black king on g8, doubled pawns on g7+g6 (rank-1 and rank-2 for black).
+        let board_doubled = board_from_fen("6k1/6p1/6p1/8/8/8/8/4K3 w - - 0 1");
+        // Black king on g8, single pawn on g7 (primary shield).
+        let board_single  = board_from_fen("6k1/6p1/8/8/8/8/8/4K3 w - - 0 1");
+        let ks_doubled = evaluate_king_safety(&board_doubled, false);
+        let ks_single  = evaluate_king_safety(&board_single,  false);
+        // After fix: doubled gives same shield score as single.
+        assert_eq!(ks_doubled, ks_single,
+            "fix B (black): doubled-stack rank-2 pawn must not earn secondary shield bonus: \
+             doubled={ks_doubled} single={ks_single}");
     }
 }
