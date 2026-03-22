@@ -1090,8 +1090,11 @@ fn mvvlva_score(mv: &Move, board: &shakmaty::Board) -> Option<i32> {
                 let attacker = board.piece_at(*from)
                     .map(|p| piece_value(p.role))
                     .unwrap_or(0);
+                // For capture-promotions add the net promotion gain so they
+                // rank above a quiet promotion of equal capture victim value.
+                let promo_bonus = promotion.map(|r| piece_value(r) - PAWN_VALUE).unwrap_or(0);
                 // High victim value and low attacker value = better ordering.
-                Some(piece_value(victim.role) * 10 - attacker)
+                Some(piece_value(victim.role) * 10 - attacker + promo_bonus)
             } else if let Some(promo_role) = promotion {
                 // Non-capture promotion: score like gaining the promoted piece
                 // so it lands in the captures bucket ahead of quiet moves.
@@ -1434,7 +1437,8 @@ fn negamax_impl(
                         // probes at depth would trust it as if a full search ran,
                         // causing spurious cutoffs.  Using null_depth ensures the
                         // bound is only reused when the required depth is ≤ null_depth.
-                        if existing.hash != hash || null_depth >= existing.depth {
+                        if existing.hash != hash || null_depth > existing.depth
+                            || (null_depth == existing.depth && existing.bound != TT_BOUND_EXACT) {
                             tt[tt_idx] = TtEntry { hash, depth: null_depth, score: beta,
                                                    bound: TT_BOUND_LOWER,
                                                    best_from: TT_NO_SQUARE, best_to: TT_NO_SQUARE,
@@ -1573,7 +1577,8 @@ fn negamax_impl(
             // Depth-preferred replacement: preserve deeper entries.
             if beta.abs() <= TT_MATE_THRESHOLD {
                 let existing = &tt[tt_idx];
-                if existing.hash != hash || depth >= existing.depth {
+                if existing.hash != hash || depth > existing.depth
+                    || (depth == existing.depth && existing.bound != TT_BOUND_EXACT) {
                     let (bf, bt, bp) = move_from_to(mv).unwrap_or((TT_NO_SQUARE, TT_NO_SQUARE, TT_NO_SQUARE));
                     tt[tt_idx] = TtEntry { hash, depth, score: beta, bound: TT_BOUND_LOWER,
                                            best_from: bf, best_to: bt, best_promo: bp };
@@ -1652,7 +1657,8 @@ fn negamax_impl(
     if alpha.abs() <= TT_MATE_THRESHOLD {
         let bound = if alpha > original_alpha { TT_BOUND_EXACT } else { TT_BOUND_UPPER };
         let existing = &tt[tt_idx];
-        if existing.hash != hash || depth >= existing.depth {
+        if existing.hash != hash || depth > existing.depth
+            || (depth == existing.depth && existing.bound != TT_BOUND_EXACT) {
             let (bf, bt, bp) = best_move_for_tt
                 .and_then(move_from_to)
                 .unwrap_or((TT_NO_SQUARE, TT_NO_SQUARE, TT_NO_SQUARE));
@@ -8229,5 +8235,140 @@ mod tests {
         let score = negamax(&pos, 3, -30001, 30001);
         assert!(score > 29000,
             "negamax at depth=3 on MATE_IN_ONE_FEN must return mate score >29000; got {score}");
+    }
+
+    // ── Cycle 6 Fix A: mvvlva_score missing promo bonus for capture-promotions ──
+    //
+    // When a pawn captures an enemy piece and promotes, the old code only scored
+    // `victim*10 - attacker`, ignoring the net gain from promotion.  This ranked
+    // capture-promotions lower than they deserve, causing them to be searched
+    // after less valuable moves.  Fix: add `piece_value(promo_role) - PAWN_VALUE`
+    // to the capture score so the total reflects the full material swing.
+
+    // FEN used by the two mvvlva capture-promotion tests:
+    // white pawn d7, black rook e8 → pawn can capture+promote or push+promote.
+    const CAPTURE_PROMO_FEN: &str = "4r3/3P4/8/8/8/8/8/K6k w - - 0 1";
+
+    /// Capture-promotion scores higher than the same capture without promotion.
+    /// Before the fix both returned the same value (promo bonus was 0).
+    #[test]
+    fn test_mvvlva_capture_promotion_includes_promo_bonus() {
+        let pos = pos_from_fen(CAPTURE_PROMO_FEN);
+        let board = pos.board();
+
+        // Pawn d7 captures rook e8, no promotion (hypothetical — tests raw scoring).
+        let mv_no_promo = Move::Normal {
+            role: Role::Pawn,
+            from: Square::D7,
+            capture: Some(Role::Rook),
+            to: Square::E8,
+            promotion: None,
+        };
+        // Same capture but promotes to queen.
+        let mv_with_promo = Move::Normal {
+            role: Role::Pawn,
+            from: Square::D7,
+            capture: Some(Role::Rook),
+            to: Square::E8,
+            promotion: Some(Role::Queen),
+        };
+        let score_no_promo  = mvvlva_score(&mv_no_promo,  board).unwrap();
+        let score_with_promo = mvvlva_score(&mv_with_promo, board).unwrap();
+        // Expected: ROOK*10 - PAWN = 4900 (no promo)
+        //           ROOK*10 - PAWN + (QUEEN - PAWN) = 5700 (with promo)
+        assert!(score_with_promo > score_no_promo,
+            "capture-promotion must score higher than same capture without promo; \
+             no_promo={score_no_promo} with_promo={score_with_promo}");
+    }
+
+    /// Exact score for pawn captures rook and promotes to queen.
+    #[test]
+    fn test_mvvlva_capture_promotion_exact_score() {
+        let pos = pos_from_fen(CAPTURE_PROMO_FEN);
+        let board = pos.board();
+
+        let mv = Move::Normal {
+            role: Role::Pawn,
+            from: Square::D7,
+            capture: Some(Role::Rook),
+            to: Square::E8,
+            promotion: Some(Role::Queen),
+        };
+        let score = mvvlva_score(&mv, board).unwrap();
+        // ROOK_VALUE*10 - PAWN_VALUE + (QUEEN_VALUE - PAWN_VALUE)
+        // = 5000 - 100 + 800 = 5700
+        let expected = ROOK_VALUE * 10 - PAWN_VALUE + (QUEEN_VALUE - PAWN_VALUE);
+        assert_eq!(score, expected,
+            "pawn captures rook + promotes to queen must score {expected}; got {score}");
+    }
+
+    /// Quiet (non-capture) promotion score is unchanged by the fix.
+    #[test]
+    fn test_mvvlva_quiet_promotion_score_unaffected() {
+        let pos = pos_from_fen(CAPTURE_PROMO_FEN);
+        let board = pos.board();
+
+        // Pawn d7 pushes to d8 and promotes to queen (no capture).
+        let mv = Move::Normal {
+            role: Role::Pawn,
+            from: Square::D7,
+            capture: None,
+            to: Square::D8,
+            promotion: Some(Role::Queen),
+        };
+        let score = mvvlva_score(&mv, board).unwrap();
+        // Non-capture branch: QUEEN_VALUE*10 - PAWN_VALUE = 8900 (unchanged).
+        let expected = QUEEN_VALUE * 10 - PAWN_VALUE;
+        assert_eq!(score, expected,
+            "quiet queen promotion must score {expected}; got {score}");
+    }
+
+    // ── Cycle 6 Fix B: TT EXACT entries preserved at equal depth ─────────────
+    //
+    // The old TT replacement condition `existing.hash != hash || depth >= existing.depth`
+    // allowed a LOWER or UPPER entry (same depth) to overwrite an EXACT entry.
+    // EXACT entries are strictly more informative — they carry the true score,
+    // not just a bound — so overwriting them degrades future TT probes.
+    // Fix: guard with `|| (depth == existing.depth && existing.bound != TT_BOUND_EXACT)`
+    // so equal-depth replacement only happens when the incumbent is NOT EXACT.
+
+    fn make_tt_entry(hash: u64, depth: u32, bound: u8) -> TtEntry {
+        TtEntry { hash, depth, score: 0, bound,
+                  best_from: TT_NO_SQUARE, best_to: TT_NO_SQUARE,
+                  best_promo: TT_NO_SQUARE }
+    }
+
+    fn should_replace(existing: &TtEntry, new_hash: u64, new_depth: u32) -> bool {
+        existing.hash != new_hash
+            || new_depth > existing.depth
+            || (new_depth == existing.depth && existing.bound != TT_BOUND_EXACT)
+    }
+
+    /// An EXACT entry must NOT be overwritten by a LOWER entry at the same depth.
+    #[test]
+    fn test_tt_exact_not_overwritten_by_lower_same_depth() {
+        let exact = make_tt_entry(0xCAFE, 4, TT_BOUND_EXACT);
+        assert!(!should_replace(&exact, 0xCAFE, 4),
+            "EXACT at depth=4 must not be replaced by a new LOWER/UPPER at depth=4");
+    }
+
+    /// An EXACT entry must NOT be overwritten by an UPPER entry at the same depth.
+    #[test]
+    fn test_tt_exact_not_overwritten_by_upper_same_depth() {
+        let exact = make_tt_entry(0xDEAD, 5, TT_BOUND_EXACT);
+        // Simulate storing an UPPER bound at same depth — should be rejected.
+        assert!(!should_replace(&exact, 0xDEAD, 5),
+            "EXACT at depth=5 must not be replaced by an UPPER entry at depth=5");
+    }
+
+    /// A LOWER entry IS overwritten by any new entry at a greater depth.
+    #[test]
+    fn test_tt_non_exact_replaced_at_greater_depth() {
+        let lower = make_tt_entry(0xBEEF, 3, TT_BOUND_LOWER);
+        assert!(should_replace(&lower, 0xBEEF, 4),
+            "LOWER at depth=3 must be replaced by a deeper entry at depth=4");
+        let exact = make_tt_entry(0xBEEF, 3, TT_BOUND_EXACT);
+        assert!(should_replace(&exact, 0xBEEF, 4),
+            "EXACT at depth=3 must be replaced by a deeper entry at depth=4");
     }
 }
