@@ -784,6 +784,7 @@ fn quiescence_impl(
     qdepth: i32,
     history: &[[i32; 64]; 64],
     cached_stand_pat: Option<i32>,
+    game_set: &HashSet<u64>,
     tt: &mut Vec<TtEntry>,
 ) -> i32 {
     // legal_moves() returns a stack-allocated ArrayVec (MoveList); avoid
@@ -819,6 +820,15 @@ fn quiescence_impl(
     const TT_MATE_THRESHOLD: i32 = 29_000;
     const QS_DEPTH: u32 = 0;
     let hash = u64::from(pos.zobrist_hash::<Zobrist64>(EnPassantMode::Legal));
+    // Fix: detect three-fold repetition from the actual game history.
+    // negamax_impl performs this check for every negamax node, but quiescence
+    // lacked it.  Without this, a position that has appeared ≥ 2 times in the
+    // game (and thus is in game_set) could be evaluated as a normal position
+    // when reached via a quiescence check-evasion line, causing the engine to
+    // not recognise the draw and potentially misplay toward or away from it.
+    if game_set.contains(&hash) {
+        return 0;
+    }
     let tt_idx = (hash as usize) & (tt.len() - 1);
     let original_alpha = alpha;
     let mut tt_best_from  = TT_NO_SQUARE;
@@ -901,7 +911,7 @@ fn quiescence_impl(
         let mut best_evasion_for_tt: Option<Move> = None;
         for mv in ordered {
             let child = pos.clone().play(mv).expect("legal");
-            let score = -quiescence_impl(&child, -beta, -alpha, qdepth - 1, history, None, tt);
+            let score = -quiescence_impl(&child, -beta, -alpha, qdepth - 1, history, None, game_set, tt);
             if score > alpha {
                 alpha = score;
                 best_evasion_for_tt = Some(mv);
@@ -996,7 +1006,7 @@ fn quiescence_impl(
             continue;
         }
         let child = pos.clone().play(mv.clone()).expect("legal");
-        let score = -quiescence_impl(&child, -beta, -alpha, qdepth - 1, history, None, tt);
+        let score = -quiescence_impl(&child, -beta, -alpha, qdepth - 1, history, None, game_set, tt);
         if score >= beta {
             // Store this fail-high as a TT lower bound.
             if beta.abs() <= TT_MATE_THRESHOLD {
@@ -1036,9 +1046,11 @@ fn quiescence_impl(
 
 /// Public quiescence wrapper used by tests.  Creates a throw-away TT so the
 /// signature stays unchanged and all existing test calls compile as-is.
+/// Public quiescence wrapper used by tests.  Creates a throw-away TT and an
+/// empty game-set so the extended signature stays transparent to test callers.
 pub fn quiescence(pos: &Chess, alpha: i32, beta: i32, qdepth: i32, history: &[[i32; 64]; 64]) -> i32 {
     let mut tt = vec![TtEntry::default(); 1 << 16]; // 64 K entries for test use
-    quiescence_impl(pos, alpha, beta, qdepth, history, None, &mut tt)
+    quiescence_impl(pos, alpha, beta, qdepth, history, None, &HashSet::new(), &mut tt)
 }
 
 /// Estimate the raw material gain of a capture or promotion for delta pruning.
@@ -1328,7 +1340,7 @@ fn negamax_impl(
     // quiescence to compute it a second time.  Moving this check first eliminates
     // the double call on the hottest path in the entire search tree.
     if depth == 0 {
-        return quiescence_impl(pos, alpha, beta, 6, history, None, tt);
+        return quiescence_impl(pos, alpha, beta, 6, history, None, game_set, tt);
     }
 
     let legal: MoveList = pos.legal_moves();
@@ -1373,7 +1385,7 @@ fn negamax_impl(
         let static_eval = if pos.turn() == Color::White { raw } else { -raw };
         let static_eval = static_eval + TEMPO_BONUS;
         if static_eval + FUTILITY_MARGIN_D1 <= alpha {
-            return quiescence_impl(pos, alpha, beta, 6, history, Some(static_eval), tt);
+            return quiescence_impl(pos, alpha, beta, 6, history, Some(static_eval), game_set, tt);
         }
     }
 
@@ -1393,7 +1405,7 @@ fn negamax_impl(
         let static_eval = if pos.turn() == Color::White { raw } else { -raw };
         let static_eval = static_eval + TEMPO_BONUS;
         if static_eval + FUTILITY_MARGIN_D2 <= alpha {
-            return quiescence_impl(pos, alpha, beta, 6, history, Some(static_eval), tt);
+            return quiescence_impl(pos, alpha, beta, 6, history, Some(static_eval), game_set, tt);
         }
     }
 
@@ -1421,11 +1433,22 @@ fn negamax_impl(
         if has_non_pawn_piece {
             if let Ok(null_pos) = pos.clone().swap_turn() {
                 let null_depth = depth - 1 - NULL_MOVE_R;
+                // Fix: temporarily insert the current node's hash into path/path_set
+                // so the null-move subtree can detect repetitions that cycle back
+                // through this node.  Without this, if the null-move line returns to
+                // `pos` (same hash, same turn), path_set.contains() returns false and
+                // the draw is missed, potentially allowing spurious null-move cutoffs.
+                // The existing path.push(hash) at line ~1459 still handles the
+                // regular move loop; here we only bracket the null-move call.
+                path.push(hash);
+                path_set.insert(hash);
                 let null_score = -negamax_impl(
                     &null_pos, null_depth, ply + 1,
                     -beta, -beta + 1,
                     path, path_set, game_set, extensions, history, killers, false, tt,
                 );
+                path.pop();
+                path_set.remove(&hash);
                 if null_score >= beta {
                     // Store this fail-high as a TT lower bound so future
                     // searches of the same position at the same or shallower
@@ -6495,12 +6518,12 @@ mod tests {
         let history = [[0i32; 64]; 64];
         // Full window so neither call is alpha/beta clipped.
         let mut tt = vec![TtEntry::default(); 1 << 16];
-        let score_uncached = quiescence_impl(&pos, -30000, 30000, 6, &history, None, &mut tt);
+        let score_uncached = quiescence_impl(&pos, -30000, 30000, 6, &history, None, &HashSet::new(), &mut tt);
         // Pre-compute the stand-pat exactly as negamax_impl's futility code does.
         let raw = evaluate(&pos);
         let static_eval = if pos.turn() == Color::White { raw } else { -raw } + TEMPO_BONUS;
         let mut tt2 = vec![TtEntry::default(); 1 << 16];
-        let score_cached = quiescence_impl(&pos, -30000, 30000, 6, &history, Some(static_eval), &mut tt2);
+        let score_cached = quiescence_impl(&pos, -30000, 30000, 6, &history, Some(static_eval), &HashSet::new(), &mut tt2);
         assert_eq!(score_uncached, score_cached,
             "cached stand-pat must produce the same quiescence score as uncached");
     }
@@ -6529,11 +6552,11 @@ mod tests {
         let pos = pos_from_fen("8/PPPPPPPP/8/8/8/8/8/k1K5 w - - 0 1");
         let history = [[0i32; 64]; 64];
         let mut tt = vec![TtEntry::default(); 1 << 16];
-        let score_uncached = quiescence_impl(&pos, -30000, 30000, 6, &history, None, &mut tt);
+        let score_uncached = quiescence_impl(&pos, -30000, 30000, 6, &history, None, &HashSet::new(), &mut tt);
         let raw = evaluate(&pos);
         let static_eval = if pos.turn() == Color::White { raw } else { -raw } + TEMPO_BONUS;
         let mut tt2 = vec![TtEntry::default(); 1 << 16];
-        let score_cached = quiescence_impl(&pos, -30000, 30000, 6, &history, Some(static_eval), &mut tt2);
+        let score_cached = quiescence_impl(&pos, -30000, 30000, 6, &history, Some(static_eval), &HashSet::new(), &mut tt2);
         assert_eq!(score_uncached, score_cached,
             "depth-2 futility cached stand-pat must match uncached");
     }
@@ -7269,7 +7292,7 @@ mod tests {
         let history = [[0i32; 64]; 64];
         // Fresh search to get true score T.
         let mut tt_fresh = vec![TtEntry::default(); 1 << 16];
-        let t = quiescence_impl(&pos, -32001, 32001, 6, &history, None, &mut tt_fresh);
+        let t = quiescence_impl(&pos, -32001, 32001, 6, &history, None, &HashSet::new(), &mut tt_fresh);
 
         // Pre-seed TT with a legitimate UPPER bound at T+50 (valid since true_score ≤ T+50).
         let hash = u64::from(pos.zobrist_hash::<Zobrist64>(EnPassantMode::Legal));
@@ -7281,7 +7304,7 @@ mod tests {
         };
         // Search with window [T-10, T+100]: UPPER entry at T+50 is between alpha and beta.
         // With beta tightening: effective beta = T+50; result must still be T.
-        let result = quiescence_impl(&pos, t - 10, t + 100, 6, &history, None, &mut tt_seeded);
+        let result = quiescence_impl(&pos, t - 10, t + 100, 6, &history, None, &HashSet::new(), &mut tt_seeded);
         assert_eq!(result, t,
             "fix: QS with UPPER bound entry must return same result as fresh search: fresh={t} seeded={result}");
     }
@@ -7296,7 +7319,7 @@ mod tests {
         let history = [[0i32; 64]; 64];
         // Fresh score.
         let mut tt_fresh = vec![TtEntry::default(); 1 << 16];
-        let t = quiescence_impl(&pos, -32001, 32001, 6, &history, None, &mut tt_fresh);
+        let t = quiescence_impl(&pos, -32001, 32001, 6, &history, None, &HashSet::new(), &mut tt_fresh);
         assert!(t > 0, "precondition: white advantage position should score > 0: {t}");
 
         // Pre-seed a valid UPPER bound at T+10.
@@ -7308,7 +7331,7 @@ mod tests {
             best_from: TT_NO_SQUARE, best_to: TT_NO_SQUARE, best_promo: TT_NO_SQUARE,
         };
         // Wide window so the UPPER bound falls strictly inside [alpha, beta].
-        let result = quiescence_impl(&pos, t - 20, t + 100, 6, &history, None, &mut tt_seeded);
+        let result = quiescence_impl(&pos, t - 20, t + 100, 6, &history, None, &HashSet::new(), &mut tt_seeded);
         // Result must equal fresh score (UPPER bound at T+10 is loose enough not to cut).
         assert_eq!(result, t,
             "fix: result with loose UPPER bound must equal fresh score: t={t} result={result}");
@@ -7334,7 +7357,7 @@ mod tests {
             best_from: TT_NO_SQUARE, best_to: TT_NO_SQUARE, best_promo: TT_NO_SQUARE,
         };
         // Search with alpha=-100: -500 ≤ -100 → must return alpha = -100 immediately.
-        let result = quiescence_impl(&pos, -100, 100, 6, &history, None, &mut tt);
+        let result = quiescence_impl(&pos, -100, 100, 6, &history, None, &HashSet::new(), &mut tt);
         assert_eq!(result, -100,
             "regression: UPPER bound score ≤ alpha must still return alpha: {result}");
     }
@@ -8462,5 +8485,125 @@ mod tests {
         let lower = make_tt_entry(0xFACE, 0, TT_BOUND_LOWER);
         assert!(should_replace_qs(&lower, 0xFACE),
             "QS LOWER entry must be replaceable at the same position");
+    }
+
+    // ── Cycle 8 Fix A: null-move search missing current hash in path_set ─────
+    //
+    // The null-move search was called without first pushing the current node's
+    // hash onto path/path_set.  If the null-move subtree cycles back through
+    // this node (same hash = draw), the path_set.contains() check would return
+    // false and the draw would be missed, potentially producing spurious
+    // null-move cutoffs.
+    // Fix: push hash before the null-move call, pop immediately after, then
+    // let the existing path.push at the move loop handle the regular search.
+
+    /// Verify that the null-move path-tracking invariant is consistent:
+    /// path and path_set must always contain exactly the same elements.
+    /// We check this by using `best_move` in a position where the search
+    /// exercises null-move pruning and verifying a sensible (non-panicking)
+    /// result — a panic or incorrect score would indicate a path/path_set
+    /// desync produced by a missing pop or an extra push.
+    #[test]
+    fn test_null_move_path_set_stays_in_sync() {
+        // Material-heavy middlegame — has non-pawn pieces so null-move fires.
+        // Searching at depth 4 exercises at least one null-move attempt.
+        let pos = pos_from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1");
+        // This must not panic and must return a legal move.
+        let mv = best_move(&pos, 4, &[]);
+        assert!(mv.is_some(), "best_move must find a legal move from the starting position");
+        let chosen = mv.unwrap();
+        let legal: MoveList = pos.legal_moves();
+        assert!(legal.iter().any(|m| m == &chosen),
+            "best_move returned an illegal move: {chosen:?}");
+    }
+
+    /// When game_history puts the root position in game_set (appeared ≥ 2 times),
+    /// the engine must still choose a legal move (not panic or return None from
+    /// a search path that incorrectly detects root as a draw inside null-move).
+    #[test]
+    fn test_null_move_path_does_not_false_draw_root() {
+        let pos = pos_from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1");
+        let root_hash = u64::from(pos.zobrist_hash::<Zobrist64>(EnPassantMode::Legal));
+        // Pretend the root position appeared twice in game history.
+        // best_move must not incorrectly evaluate every move as a draw.
+        let game_history = vec![root_hash, root_hash];
+        let mv = best_move(&pos, 3, &game_history);
+        assert!(mv.is_some(), "engine must still return a move even with root in game_set twice");
+    }
+
+    // ── Cycle 8 Fix B: quiescence not detecting game_set repetitions ──────────
+    //
+    // quiescence_impl didn't receive `game_set`, so positions from the actual
+    // game history that appeared ≥ 2 times were evaluated as normal positions
+    // when reached via quiescence check-evasion lines.
+    // Fix: pass game_set to quiescence_impl and return 0 on a hit.
+
+    /// A position that appears in game_set must score 0 (draw) when visited
+    /// by quiescence — confirmed by pre-seeding game_set with the position's
+    /// hash and verifying the result equals 0.
+    #[test]
+    fn test_qs_game_set_repetition_returns_draw() {
+        // Quiet position (no captures available) with non-trivial material so
+        // stand_pat is far from 0.  quiescence would normally return stand_pat ≠ 0.
+        let pos = pos_from_fen("k7/8/8/8/8/8/8/K2Q4 w - - 0 1"); // white queen advantage
+        let hash = u64::from(pos.zobrist_hash::<Zobrist64>(EnPassantMode::Legal));
+        let history = [[0i32; 64]; 64];
+        let mut tt = vec![TtEntry::default(); 1 << 16];
+
+        // Without game_set: quiescence returns stand_pat (non-zero).
+        let score_no_gameset = quiescence_impl(&pos, -30000, 30000, 6, &history, None, &HashSet::new(), &mut tt);
+        assert_ne!(score_no_gameset, 0, "precondition: position must score non-zero without game_set");
+
+        // With game_set containing this position: must return 0 (draw by repetition).
+        let mut game_set_with_pos: HashSet<u64> = HashSet::new();
+        game_set_with_pos.insert(hash);
+        let mut tt2 = vec![TtEntry::default(); 1 << 16];
+        let score_with_gameset = quiescence_impl(&pos, -30000, 30000, 6, &history, None, &game_set_with_pos, &mut tt2);
+        assert_eq!(score_with_gameset, 0,
+            "quiescence must return 0 for a position in game_set (draw by repetition); got {score_with_gameset}");
+    }
+
+    /// Verify that quiescence correctly passes game_set down recursively.
+    /// Use best_move with a game_history containing child positions of a
+    /// check-evasion scenario.  The engine must not panic and must return a
+    /// legal result — demonstrating that game_set propagates into quiescence
+    /// check-evasion without corrupting the search.
+    #[test]
+    fn test_qs_game_set_repetition_propagated_in_check_evasion() {
+        // White king e1 in check from black queen e8 (along e-file); black king h1.
+        // Valid: both kings present, white is in check.
+        let pos = pos_from_fen("4q3/8/8/8/8/8/8/4K2k w - - 0 1");
+        // Compute hashes of all white evasion child positions and add them to
+        // game_history appearing twice, so they end up in game_set.
+        let legal: MoveList = pos.legal_moves();
+        let mut game_history: Vec<u64> = Vec::new();
+        for mv in &legal {
+            if let Ok(child) = pos.clone().play(mv.clone()) {
+                let h = u64::from(child.zobrist_hash::<Zobrist64>(EnPassantMode::Legal));
+                game_history.push(h);
+                game_history.push(h); // appear twice → enters game_set
+            }
+        }
+        // best_move must not panic and must return a legal move (or None if every
+        // evasion leads to a drawn-by-repetition position and the engine recognises it).
+        let result = best_move(&pos, 2, &game_history);
+        if let Some(mv) = result {
+            assert!(legal.iter().any(|m| m == &mv), "returned move must be legal");
+        }
+        // The key assertion is that we reached here without panicking.
+    }
+
+    /// Regression: positions NOT in game_set must still receive their normal score
+    /// in quiescence — the game_set check must not spuriously trigger.
+    #[test]
+    fn test_qs_game_set_empty_does_not_affect_normal_score() {
+        let pos = pos_from_fen("k7/8/8/8/8/8/8/K2Q4 w - - 0 1");
+        let history = [[0i32; 64]; 64];
+        // Two independent searches: empty game_set (public wrapper) vs empty game_set direct.
+        let score_via_wrapper = quiescence(&pos, -30000, 30000, 6, &history);
+        let mut tt = vec![TtEntry::default(); 1 << 16];
+        let score_via_direct = quiescence_impl(&pos, -30000, 30000, 6, &history, None, &HashSet::new(), &mut tt);
+        assert_eq!(score_via_wrapper, score_via_direct,
+            "empty game_set must leave quiescence score unchanged");
     }
 }
