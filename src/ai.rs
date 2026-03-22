@@ -286,7 +286,14 @@ fn evaluate_pawn_structure(board: &shakmaty::Board, turn: shakmaty::Color) -> i3
             // that free move.
             const UNSTOPPABLE_BONUS: i32 = 50;
             if let Some((bkf, bkr)) = black_king_pos {
-                let pawn_moves = (7 - wr as i32).max(0);
+                // Fix #58b: white pawns on rank 2 (wr == 1, the starting rank)
+                // can advance two squares in one move, so they need only 5 moves
+                // to promote, not 6.  The formula `7 - wr` gives 6 for wr=1,
+                // which overestimates by 1 and prevents the UNSTOPPABLE_BONUS
+                // from firing when the enemy king is exactly 6 squares away
+                // (threshold = 5 with the fix, 6 without — bonus fires at 6 > 5
+                // but not at 6 > 6).  Subtract 1 for the double-advance ply.
+                let pawn_moves = (7 - wr as i32 - (wr == 1) as i32).max(0);
                 let king_dist = (bkf - wf as i32).abs().max(7 - bkr);
                 let threshold = if turn == shakmaty::Color::White {
                     pawn_moves
@@ -325,7 +332,12 @@ fn evaluate_pawn_structure(board: &shakmaty::Board, turn: shakmaty::Color) -> i3
             // gets a free king move, so threshold = pawn_moves + 1.
             const UNSTOPPABLE_BONUS: i32 = 50;
             if let Some((wkf, wkr)) = white_king_pos {
-                let pawn_moves = (br as i32).max(0);
+                // Fix #58b (symmetric): black pawns on rank 7 (br == 6, starting
+                // rank) can advance two squares in one move, needing only 5 moves
+                // to promote.  `br` gives 6 for br=6, overestimating by 1.
+                // Same correction as for white: subtract 1 ply for the
+                // double-advance on the initial rank.
+                let pawn_moves = (br as i32 - (br == 6) as i32).max(0);
                 let king_dist = (wkf - bf as i32).abs().max(wkr);
                 let threshold = if turn == shakmaty::Color::Black {
                     pawn_moves
@@ -1779,13 +1791,17 @@ pub fn best_move(pos: &Chess, depth: u32, game_history: &[u64]) -> Option<Move> 
 
         // Aspiration re-search loop: at most two passes (narrow window then full).
         loop {
-            // Snapshot history before each attempt so a failed aspiration search
-            // can be rolled back (fix #57b).  Without the rollback every failed
-            // attempt double-applies history credits and maluses to the same set
-            // of moves (all subtree cutoffs, PV credits, and quiet-move maluses
-            // fire twice), skewing move ordering in subsequent ID iterations.
-            // The copy is O(64×64 ints) = 16 KB — negligible cost.
+            // Snapshot history and killers before each attempt so a failed
+            // aspiration search can be rolled back (fix #57b / fix #58a).
+            // Without the history rollback, every failed attempt double-applies
+            // credits and maluses, skewing move ordering in subsequent ID
+            // iterations.  Without the killers rollback, stale killers from the
+            // failed narrow-window subtree persist into the re-search and later
+            // depths, since killers are position-independent heuristics whose
+            // values are only meaningful within the window that produced them.
+            // Both snapshots are cheap (16 KB for history, ~1 KB for killers).
             let history_snapshot = history.clone();
+            let killers_snapshot = killers.clone();
 
             let mut alpha = asp_lo;
             let beta = asp_hi;
@@ -1905,8 +1921,10 @@ pub fn best_move(pos: &Chess, depth: u32, game_history: &[u64]) -> Option<Move> 
             // fail-low: open the lower bound to full range and re-search.
             if best_score <= asp_lo && asp_lo > -30001 {
                 asp_lo = -30001;
-                // Rollback: discard history changes from the failed search (fix #57b).
+                // Rollback: discard history and killers changes from the failed
+                // search (fix #57b + fix #58a).
                 history = history_snapshot;
+                killers = killers_snapshot;
                 // Re-order: best move from the failed search goes first so the
                 // re-search still benefits from PV-first ordering.
                 if let Some(ref pv) = iter_best {
@@ -1917,8 +1935,9 @@ pub fn best_move(pos: &Chess, depth: u32, game_history: &[u64]) -> Option<Move> 
             // fail-high: open the upper bound to full range and re-search.
             } else if best_score >= asp_hi && asp_hi < 30001 {
                 asp_hi = 30001;
-                // Rollback: same as fail-low (fix #57b).
+                // Rollback: same as fail-low (fix #57b + fix #58a).
                 history = history_snapshot;
+                killers = killers_snapshot;
                 // Same PV-first re-ordering on fail-high.
                 if let Some(ref pv) = iter_best {
                     if let Some(idx) = ordered.iter().position(|m| m == pv) {
@@ -3812,9 +3831,12 @@ mod tests {
         // Pb2 isolated (a-file no pawn, c-file no pawn): −20.
         // Wait, Pb2 and Pd2 are on b-file and d-file — c-file is empty between them.
         // Each is isolated. Bc1 mobility = 0 (d2 blocks NE diagonal, b2 blocks NW diagonal).
+        // After fix #58b, Pb2 (wr=1, double-advance available) is recognised as
+        // unstoppable: pawn_moves=5, king_dist=max(|7-1|,0)=6 > threshold=5.
+        // Pd2 (file 3): king_dist=max(|7-3|,0)=4 ≤ 5 — NOT unstoppable.
         let expected_blocked =
             BISHOP_VALUE + BISHOP_PST[2] // Bc1: 330 - 10 = 320 + 0 mobility
-            + (PAWN_VALUE + PAWN_PST[9]  + 10 /*passed*/ - 20 /*isolated*/)  // Pb2
+            + (PAWN_VALUE + PAWN_PST[9]  + 10 /*passed*/ + 50 /*UNSTOPPABLE_BONUS*/ - 20 /*isolated*/)  // Pb2
             + (PAWN_VALUE + PAWN_PST[11] + 10 /*passed*/ - 20 /*isolated*/); // Pd2
         assert_eq!(blocked_score, expected_blocked,
             "blocked bishop Bc1 (Pb2+Pd2 block both diagonals) must have 0 mobility: \
@@ -7962,5 +7984,138 @@ mod tests {
         assert_eq!(ks_doubled, ks_single,
             "fix B (black): doubled-stack rank-2 pawn must not earn secondary shield bonus: \
              doubled={ks_doubled} single={ks_single}");
+    }
+
+    // ── Cycle 4 Fix A: killers rolled back on aspiration failure ──────────────
+    //
+    // The aspiration window loop snapshots `history` and restores it on
+    // fail-low/fail-high so that failed narrow-window searches do not double-
+    // credit or double-penalise moves.  Before Fix A, `killers` was NOT
+    // snapshotted, so stale killers from the failed search leaked into the
+    // re-search and subsequent ID iterations, degrading move ordering.
+    //
+    // Direct testing of internal killer state is not possible through the public
+    // API, so the tests below verify:
+    //  1. best_move still returns the correct move after aspiration failure.
+    //  2. The result is deterministic regardless of the internal ordering state.
+    //  3. A tactical position that requires precise ordering is solved correctly.
+
+    /// best_move delivers checkmate at depth≥3 (aspiration window active).
+    /// This verifies that killers rollback doesn't break search correctness:
+    /// the engine must still find a mating move in the MATE_IN_ONE position.
+    #[test]
+    fn test_killers_rollback_mate_in_one_still_found() {
+        // Kc7, Qb6 vs Ka8.  Both Qb8# and Qa7# are mate; just verify the
+        // engine plays something that leaves the opponent in checkmate.
+        let pos = pos_from_fen(MATE_IN_ONE_FEN);
+        // depth=4 activates aspiration windows (iter_depth >= 3) and ID.
+        let mv = best_move(&pos, 4, &[]);
+        assert!(mv.is_some(), "best_move must return a move");
+        let mv = mv.unwrap();
+        let after = pos.clone().play(mv).expect("legal move");
+        let legal_after = after.legal_moves();
+        assert!(
+            legal_after.is_empty() && after.is_check(),
+            "best_move at depth=4 on MATE_IN_ONE_FEN must deliver checkmate; played {mv:?}"
+        );
+    }
+
+    /// best_move avoids obvious blunder even when aspiration fails.
+    /// Qxd5 drops the queen to rook on c5; the engine should avoid this.
+    #[test]
+    fn test_killers_rollback_blunder_avoidance_unchanged() {
+        let pos = pos_from_fen(BLUNDER_FEN);
+        let mv = best_move(&pos, 4, &[]);
+        assert!(mv.is_some(), "best_move must return a move");
+        let mv = mv.unwrap();
+        // Qxd5 would be a square from d3 to d5; verify the engine doesn't play it.
+        if let Move::Normal { from, to, .. } = mv {
+            assert!(
+                !(from == Square::D3 && to == Square::D5),
+                "engine must not play Qxd5 (drops queen to Rxd5); got {from}-{to}"
+            );
+        }
+    }
+
+    /// Two identical calls to best_move must return the same move (determinism).
+    /// Killers polluted from a failed aspiration search in the first call must
+    /// not alter the result of the second call (which starts fresh).
+    #[test]
+    fn test_killers_rollback_deterministic_result() {
+        let pos = pos_from_fen(BLUNDER_FEN);
+        let mv1 = best_move(&pos, 4, &[]);
+        let mv2 = best_move(&pos, 4, &[]);
+        assert_eq!(mv1, mv2, "best_move must be deterministic; killers pollution would cause divergence");
+    }
+
+    // ── Cycle 4 Fix B: square-rule pawn_moves off-by-one on initial rank ──────
+    //
+    // White pawns on rank 2 (wr=1) and black pawns on rank 7 (br=6) can advance
+    // two squares in their first move.  The formula `7 - wr` (white) and `br`
+    // (black) returned 6 for starting-rank pawns, but the actual minimum moves
+    // to promote is 5 (double-advance + 4 single steps).  This caused
+    // UNSTOPPABLE_BONUS to be withheld when king_dist == 6 (threshold was 6 but
+    // should be 5), incorrectly treating genuinely unstoppable passers as stoppable.
+
+    /// White pawn on a2, black king on g8: 6 squares away from queening square a8.
+    /// With double-advance pawn_moves=5, threshold=5 (white to move),
+    /// king_dist=6 > 5 → UNSTOPPABLE_BONUS must fire.
+    ///
+    /// Score breakdown (Pa2 is isolated — only pawn, no neighbours):
+    ///   WHITE_PASSED_BONUS[1] = 10
+    ///   UNSTOPPABLE_BONUS     = 50  (new: king_dist=6 > threshold=5)
+    ///   ISOLATED_PENALTY      = −20
+    ///   Total                 = 40
+    #[test]
+    fn test_unstoppable_white_pawn_rank2_king_6_away() {
+        // White: Ka1, Pa2.  Black: Kg8.
+        // Chebyshev from g8 to queening square a8 = max(|6-0|, 7-7) = 6.
+        // pawn_moves (fixed) = 7 - 1 - 1 = 5; threshold (white to move) = 5.
+        // 6 > 5 → UNSTOPPABLE_BONUS.
+        let pos = pos_from_fen("6k1/8/8/8/8/8/P7/K7 w - - 0 1");
+        let score = evaluate_pawn_structure(pos.board(), pos.turn());
+        assert_eq!(
+            score, 40,
+            "white rank-2 passer (king 6 away) must earn UNSTOPPABLE_BONUS: \
+             passed(10)+unstoppable(50)−isolated(20)=40, got {score}"
+        );
+    }
+
+    /// Sanity: white rank-2 pawn is NOT unstoppable when king is exactly 5 squares away.
+    /// king_dist=5, threshold=5 (white to move): 5 > 5 is false → no UNSTOPPABLE_BONUS.
+    ///
+    /// Score: WHITE_PASSED_BONUS[1](10) − ISOLATED_PENALTY(20) = −10.
+    #[test]
+    fn test_not_unstoppable_white_pawn_rank2_king_5_away() {
+        // White: Ka1, Pa2.  Black: Kf8.
+        // Chebyshev from f8 to a8 = max(|5-0|, 7-7) = 5.  5 > 5 is false.
+        let pos = pos_from_fen("5k2/8/8/8/8/8/P7/K7 w - - 0 1");
+        let score = evaluate_pawn_structure(pos.board(), pos.turn());
+        assert_eq!(
+            score, -10,
+            "white rank-2 passer (king 5 away) must NOT earn UNSTOPPABLE_BONUS: \
+             passed(10)−isolated(20)=−10, got {score}"
+        );
+    }
+
+    /// Black pawn on h7, white king on b1: 6 squares from queening square h1.
+    /// With double-advance pawn_moves=5, threshold=5 (black to move),
+    /// king_dist=6 > 5 → UNSTOPPABLE_BONUS fires for black.
+    ///
+    /// Score (White's perspective):
+    ///   −BLACK_PASSED_BONUS[6](10) − UNSTOPPABLE_BONUS(50) + ISOLATED_PENALTY(20) = −40
+    #[test]
+    fn test_unstoppable_black_pawn_rank7_king_6_away() {
+        // Black: Kh8, ph7.  White: Kb1.
+        // Chebyshev from b1 to h1 = max(|1-7|, 0) = 6.
+        // pawn_moves (fixed) = 6 − 1 = 5; threshold (black to move) = 5.
+        // 6 > 5 → UNSTOPPABLE_BONUS for black.
+        let pos = pos_from_fen("7k/7p/8/8/8/8/8/1K6 b - - 0 1");
+        let score = evaluate_pawn_structure(pos.board(), pos.turn());
+        assert_eq!(
+            score, -40,
+            "black rank-7 passer (king 6 away) must earn UNSTOPPABLE_BONUS for black: \
+             −passed(10)−unstoppable(50)+isolated(20)=−40, got {score}"
+        );
     }
 }
