@@ -914,7 +914,7 @@ fn quiescence_impl(
                         .as_ref().and_then(|m| move_from_to(*m))
                         .unwrap_or((TT_NO_SQUARE, TT_NO_SQUARE, TT_NO_SQUARE));
                     let existing = &tt[tt_idx];
-                    if existing.hash != hash || existing.depth == QS_DEPTH {
+                    if existing.hash != hash || (existing.depth == QS_DEPTH && existing.bound != TT_BOUND_EXACT) {
                         tt[tt_idx] = TtEntry { hash, depth: QS_DEPTH, score: beta,
                                                bound: TT_BOUND_LOWER,
                                                best_from: bf, best_to: bt, best_promo: bp };
@@ -930,7 +930,7 @@ fn quiescence_impl(
                 .and_then(move_from_to)
                 .unwrap_or((TT_NO_SQUARE, TT_NO_SQUARE, TT_NO_SQUARE));
             let existing = &tt[tt_idx];
-            if existing.hash != hash || existing.depth == QS_DEPTH {
+            if existing.hash != hash || (existing.depth == QS_DEPTH && existing.bound != TT_BOUND_EXACT) {
                 tt[tt_idx] = TtEntry { hash, depth: QS_DEPTH, score: alpha,
                                        bound, best_from: bf, best_to: bt, best_promo: bp };
             }
@@ -939,15 +939,20 @@ fn quiescence_impl(
     }
 
     // Not in check: stand-pat correctly lets the side to move "pass".
+    // Fix: clamp to [alpha, beta] (fail-hard convention).  Returning raw
+    // stand_pat when it lies outside the current window sends an out-of-bounds
+    // value to the parent: a sub-alpha stand_pat, after negation, looks like a
+    // large positive score that incorrectly raises the parent's alpha and
+    // produces spurious beta cutoffs at sibling nodes.
     if qdepth <= 0 {
-        return stand_pat;
+        return stand_pat.clamp(alpha, beta);
     }
     if stand_pat >= beta {
         // Stand-pat cutoff: the side to move can already "pass" and score ≥ β.
         // Store as a TT lower bound so future visits skip the capture loop.
         if beta.abs() <= TT_MATE_THRESHOLD {
             let existing = &tt[tt_idx];
-            if existing.hash != hash || existing.depth == QS_DEPTH {
+            if existing.hash != hash || (existing.depth == QS_DEPTH && existing.bound != TT_BOUND_EXACT) {
                 tt[tt_idx] = TtEntry { hash, depth: QS_DEPTH, score: beta,
                                        bound: TT_BOUND_LOWER,
                                        best_from: TT_NO_SQUARE, best_to: TT_NO_SQUARE,
@@ -997,7 +1002,7 @@ fn quiescence_impl(
             if beta.abs() <= TT_MATE_THRESHOLD {
                 let (bf, bt, bp) = move_from_to(*mv).unwrap_or((TT_NO_SQUARE, TT_NO_SQUARE, TT_NO_SQUARE));
                 let existing = &tt[tt_idx];
-                if existing.hash != hash || existing.depth == QS_DEPTH {
+                if existing.hash != hash || (existing.depth == QS_DEPTH && existing.bound != TT_BOUND_EXACT) {
                     tt[tt_idx] = TtEntry { hash, depth: QS_DEPTH, score: beta,
                                            bound: TT_BOUND_LOWER,
                                            best_from: bf, best_to: bt, best_promo: bp };
@@ -1017,7 +1022,7 @@ fn quiescence_impl(
     if alpha.abs() <= TT_MATE_THRESHOLD {
         let bound = if alpha > original_alpha { TT_BOUND_EXACT } else { TT_BOUND_UPPER };
         let existing = &tt[tt_idx];
-        if existing.hash != hash || existing.depth == QS_DEPTH {
+        if existing.hash != hash || (existing.depth == QS_DEPTH && existing.bound != TT_BOUND_EXACT) {
             let (bf, bt, bp) = best_cap_for_tt
                 .and_then(move_from_to)
                 .unwrap_or((TT_NO_SQUARE, TT_NO_SQUARE, TT_NO_SQUARE));
@@ -8370,5 +8375,92 @@ mod tests {
         let exact = make_tt_entry(0xBEEF, 3, TT_BOUND_EXACT);
         assert!(should_replace(&exact, 0xBEEF, 4),
             "EXACT at depth=3 must be replaced by a deeper entry at depth=4");
+    }
+
+    // ── Cycle 7 Fix A: non-check QS depth-limit unclamped stand_pat ──────────
+    //
+    // When non-check quiescence reaches qdepth ≤ 0, the old code returned
+    // raw `stand_pat` without clamping to [alpha, beta].  If stand_pat < alpha,
+    // the caller (negamax) negates it and sees a value > -alpha, which can
+    // incorrectly raise the parent's alpha or trigger a spurious beta cutoff.
+    // The check path (qdepth ≤ 0 in check) was already fixed in Cycle 5;
+    // this is the symmetric fix for the non-check depth-limit path.
+
+    // Position for non-check QS stand_pat clamp tests: white pawn on e4, both kings.
+    // Not insufficient material (has pawn) so draw-detection is skipped.
+    // No captures available for white → QS returns stand_pat at qdepth=0.
+    const KP_VS_K_FEN: &str = "8/8/4k3/8/4P3/4K3/8/8 w - - 0 1";
+
+    /// Non-check QS at qdepth=0 must clamp a below-alpha stand_pat to alpha.
+    /// stand_pat for KPvK ≈ 100–200 cp; using alpha=5000 ensures stand_pat < alpha.
+    #[test]
+    fn test_qs_ncheck_depth_limit_clamps_below_alpha() {
+        let pos = pos_from_fen(KP_VS_K_FEN);
+        let history = Box::new([[0i32; 64]; 64]);
+        // qdepth=0, alpha=5000 >> stand_pat: clamp must return alpha=5000.
+        let result = quiescence(&pos, 5000, 6000, 0, &history);
+        assert_eq!(result, 5000,
+            "non-check QS qdepth=0 with stand_pat<alpha must return alpha=5000; got {result}");
+    }
+
+    /// Non-check QS at qdepth=0 must clamp an above-beta stand_pat to beta.
+    /// stand_pat for KPvK ≈ 100–200 cp; using beta=-5000 ensures stand_pat > beta.
+    #[test]
+    fn test_qs_ncheck_depth_limit_clamps_above_beta() {
+        let pos = pos_from_fen(KP_VS_K_FEN);
+        let history = Box::new([[0i32; 64]; 64]);
+        // qdepth=0, beta=-5000 << stand_pat: clamp must return beta=-5000.
+        let result = quiescence(&pos, -6000, -5000, 0, &history);
+        assert_eq!(result, -5000,
+            "non-check QS qdepth=0 with stand_pat>beta must return beta=-5000; got {result}");
+    }
+
+    /// Non-check QS at qdepth=0 with stand_pat inside window returns stand_pat.
+    #[test]
+    fn test_qs_ncheck_depth_limit_inside_window_unchanged() {
+        let pos = pos_from_fen(KP_VS_K_FEN);
+        let history = Box::new([[0i32; 64]; 64]);
+        // Wide window [-5000, 5000] will contain stand_pat; clamp is a no-op.
+        let r0 = quiescence(&pos, -5000, 5000, 0, &history);
+        let r6 = quiescence(&pos, -5000, 5000, 6, &history);
+        assert_eq!(r0, r6,
+            "non-check QS qdepth=0 and qdepth=6 must agree (no captures); got {r0} vs {r6}");
+    }
+
+    // ── Cycle 7 Fix B: QS TT stores overwrite EXACT entries at QS depth ──────
+    //
+    // All 5 QS TT store sites used `existing.hash != hash || existing.depth == QS_DEPTH`
+    // which let a LOWER or UPPER entry evict an EXACT entry at the same QS position.
+    // The same bug was fixed in negamax (Cycle 6 Fix B); here we apply the symmetric
+    // fix to quiescence: only overwrite QS-depth slots that are NOT EXACT.
+    // The helper `should_replace_qs` mirrors the updated store condition.
+
+    fn should_replace_qs(existing: &TtEntry, new_hash: u64) -> bool {
+        existing.hash != new_hash
+            || (existing.depth == 0 && existing.bound != TT_BOUND_EXACT)
+    }
+
+    /// A QS EXACT entry must NOT be overwritten by a LOWER at the same position.
+    #[test]
+    fn test_qs_tt_exact_not_overwritten_by_lower() {
+        let exact = make_tt_entry(0xABCD, 0, TT_BOUND_EXACT);
+        assert!(!should_replace_qs(&exact, 0xABCD),
+            "QS EXACT entry must not be overwritten by a new QS LOWER");
+    }
+
+    /// A QS EXACT entry must NOT be overwritten by an UPPER at the same position.
+    #[test]
+    fn test_qs_tt_exact_not_overwritten_by_upper() {
+        let exact = make_tt_entry(0x1234, 0, TT_BOUND_EXACT);
+        assert!(!should_replace_qs(&exact, 0x1234),
+            "QS EXACT entry must not be overwritten by a new QS UPPER");
+    }
+
+    /// A QS LOWER entry IS replaced at the same position (it is not EXACT).
+    #[test]
+    fn test_qs_tt_lower_can_be_overwritten() {
+        let lower = make_tt_entry(0xFACE, 0, TT_BOUND_LOWER);
+        assert!(should_replace_qs(&lower, 0xFACE),
+            "QS LOWER entry must be replaceable at the same position");
     }
 }
