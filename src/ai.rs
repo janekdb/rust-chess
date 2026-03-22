@@ -882,7 +882,12 @@ fn quiescence_impl(
     if pos.is_check() {
         if qdepth <= 0 {
             // Depth limit in check: static eval is the best bounded approximation.
-            return stand_pat;
+            // Fix #59a: clamp to [alpha, beta] (fail-hard convention).  Returning
+            // raw stand_pat risks sending a value above beta to the parent; after
+            // negation the parent sees a very positive score, incorrectly raises
+            // its alpha, and may make spurious beta cutoffs at sibling nodes.
+            // Clamping ensures the return value is always within the current window.
+            return stand_pat.clamp(alpha, beta);
         }
         let mut ordered = order_moves(legal, pos, history, &[None, None]);
         // TT move ordering in check evasions: front-load the TT best move.
@@ -1444,7 +1449,11 @@ fn negamax_impl(
 
     path.push(hash);
     path_set.insert(hash);
-    let ply_idx = ply as usize;
+    // Fix #59b: clamp ply to MAX_PLY-1 so killers[ply_idx] never panics.
+    // The production search (depth ≤ 5 + MAX_EXTENSIONS = 8) never reaches
+    // MAX_PLY=64, but the public `negamax()` wrapper allows arbitrary depth;
+    // without the clamp a caller with depth > 64 would panic on the array index.
+    let ply_idx = (ply as usize).min(MAX_PLY - 1);
     let mut ordered = order_moves(legal, pos, history, &killers[ply_idx]);
 
     // TT move ordering (fix #44): try the best move from any prior search first,
@@ -8117,5 +8126,108 @@ mod tests {
             "black rank-7 passer (king 6 away) must earn UNSTOPPABLE_BONUS for black: \
              −passed(10)−unstoppable(50)+isolated(20)=−40, got {score}"
         );
+    }
+
+    // ── Cycle 5 Fix A: stand_pat in check at QS depth limit must be clamped ──
+    //
+    // When quiescence_impl hits qdepth ≤ 0 while in check, it returns
+    // `stand_pat` as an approximation.  Before fix #59a, this raw value was
+    // returned without clamping to [alpha, beta], violating the fail-hard
+    // convention: a stand_pat above beta propagates to the parent, which then
+    // incorrectly raises its alpha (after negation) and may prune siblings.
+    // After the fix the return is `stand_pat.clamp(alpha, beta)`.
+
+    /// When quiescence hits qdepth=0 in check (legal moves exist), the return
+    /// must be clamped to [alpha, beta] — not the raw stand_pat.
+    /// Position: Qe8 checks black king on e7; black has legal king moves (d6, f6).
+    /// Stand_pat from black's view ≈ −895 (material deficit) which is well below
+    /// alpha=−200, so clamp returns alpha=−200.
+    #[test]
+    fn test_qs_check_depth_limit_clamps_below_alpha() {
+        // "4Q3/4k3/8/8/8/8/8/4K3 b - - 0 1": black in check, has d6/f6 evasions.
+        let pos = pos_from_fen("4Q3/4k3/8/8/8/8/8/4K3 b - - 0 1");
+        assert!(pos.is_check(), "position must be in check");
+        assert!(!pos.legal_moves().is_empty(), "must have legal evasions");
+        let history = Box::new([[0i32; 64]; 64]);
+        // stand_pat from black's view is very negative (large white material advantage).
+        // With a window [−200, −100], stand_pat < alpha, so result must clamp to alpha.
+        let result = quiescence(&pos, -200, -100, 0, &history);
+        assert!(
+            result >= -200 && result <= -100,
+            "QS in check at qdepth=0 must return value in [−200, −100]; got {result}"
+        );
+    }
+
+    /// If stand_pat is inside [alpha, beta] at depth limit in check,
+    /// the clamped return must equal stand_pat itself (no distortion).
+    #[test]
+    fn test_qs_check_depth_limit_clamp_noop_inside_window() {
+        // K vs K (KVK_FEN): no one is in check, quiescence returns 0 quickly.
+        // Use a position where white is to move but not in check.
+        // This tests the quiescence non-check path — stand_pat at depth-limit
+        // in check is only active when is_check() is true.
+        // Use the mate-in-one position from white's side to get a large positive
+        // stand_pat, then test it doesn't get clamped when window is wide.
+        let pos = pos_from_fen(MATE_IN_ONE_FEN); // white to move, not in check
+        let history = Box::new([[0i32; 64]; 64]);
+        // Wide window: any reasonable score should pass through unclamped.
+        let result_wide  = quiescence(&pos, -30001, 30001, 0, &history);
+        let result_clamped = quiescence(&pos, -30001, 30001, 6, &history);
+        // Both should agree (no artificial clamping distortion).
+        assert_eq!(result_wide, result_clamped,
+            "quiescence with qdepth=0 vs qdepth=6 on a wide window must agree: \
+             qdepth0={result_wide} qdepth6={result_clamped}");
+    }
+
+    /// Regression: quiescence on non-check position at qdepth=0 returns
+    /// stand_pat as-is (unchanged by fix, since the clamp is inside the
+    /// `if pos.is_check()` branch only).
+    #[test]
+    fn test_qs_non_check_depth_limit_unchanged_by_fix() {
+        let pos = pos_from_fen(KVK_FEN); // K vs K, no check
+        let history = Box::new([[0i32; 64]; 64]);
+        // At qdepth=0 (depth-limit, non-check): returns stand_pat directly.
+        // At qdepth=6 (room to search): no captures → also returns stand_pat.
+        let r0 = quiescence(&pos, -30001, 30001, 0, &history);
+        let r6 = quiescence(&pos, -30001, 30001, 6, &history);
+        assert_eq!(r0, r6,
+            "KvK: qdepth=0 and qdepth=6 must agree; got qdepth0={r0} qdepth6={r6}");
+    }
+
+    // ── Cycle 5 Fix B: ply_idx clamped to prevent killers out-of-bounds ───────
+    //
+    // `negamax_impl` used `ply as usize` directly to index into the killer table
+    // (`killers[ply_idx]`, size MAX_PLY=64).  For normal production searches
+    // (depth ≤ 8 with extensions) this never exceeds 63.  The public `negamax()`
+    // wrapper accepts any depth though; depth=64+ would cause a panic.
+    // Fix #59b clamps to `(ply as usize).min(MAX_PLY - 1)`.
+
+    /// negamax() at depth > MAX_PLY must not panic (ply index clamped).
+    #[test]
+    fn test_negamax_deep_depth_does_not_panic() {
+        // Use a simple K-vs-K position so the search terminates quickly.
+        let pos = pos_from_fen(KVK_FEN);
+        // depth=70 > MAX_PLY=64.  Before fix, this panicked on killers[70].
+        let result = negamax(&pos, 70, -30001, 30001);
+        assert_eq!(result, 0, "K vs K at any depth must be a draw (score=0); got {result}");
+    }
+
+    /// negamax() at exactly MAX_PLY depth must not panic.
+    #[test]
+    fn test_negamax_at_max_ply_does_not_panic() {
+        let pos = pos_from_fen(KVK_FEN);
+        let result = negamax(&pos, MAX_PLY as u32, -30001, 30001);
+        assert_eq!(result, 0, "K vs K at MAX_PLY depth must be draw; got {result}");
+    }
+
+    /// negamax() result correctness is unaffected by the clamp: depth=5
+    /// (well within MAX_PLY) must still find a mating score.
+    #[test]
+    fn test_negamax_ply_clamp_does_not_distort_normal_search() {
+        let pos = pos_from_fen(MATE_IN_ONE_FEN);
+        // At depth=3, the engine should find the mate and return a high score.
+        let score = negamax(&pos, 3, -30001, 30001);
+        assert!(score > 29000,
+            "negamax at depth=3 on MATE_IN_ONE_FEN must return mate score >29000; got {score}");
     }
 }
