@@ -1452,7 +1452,7 @@ fn negamax_impl(
                 let null_score = -negamax_impl(
                     &null_pos, null_depth, ply + 1,
                     -beta, -beta + 1,
-                    path, path_set, game_set, extensions, history, killers, false, tt,
+                    path, path_set, game_set, 0, history, killers, false, tt,
                 );
                 path.pop();
                 path_set.remove(&hash);
@@ -1957,10 +1957,10 @@ pub fn best_move(pos: &Chess, depth: u32, game_history: &[u64]) -> Option<Move> 
                     let is_root_killer = killers[0][0] == Some(*mv) || killers[0][1] == Some(*mv);
                     if !is_root_killer {
                         if let Move::Normal { from, to, promotion: None, .. } = *mv {
-                            history[from as usize][to as usize] -= child_depth as i32;
+                            history[from as usize][to as usize] -= iter_depth as i32;
                         }
                         if let Move::Castle { king, rook } = *mv {
-                            history[king as usize][rook as usize] -= child_depth as i32;
+                            history[king as usize][rook as usize] -= iter_depth as i32;
                         }
                     }
                 }
@@ -1980,14 +1980,14 @@ pub fn best_move(pos: &Chess, depth: u32, game_history: &[u64]) -> Option<Move> 
                     // else: root_best_quiet (a prior quiet alpha-raiser) will be
                     // credited after the break via the normal PV credit path.
                     if let Move::Normal { from, to, promotion: None, .. } = *mv {
-                        history[from as usize][to as usize] += child_depth as i32 * child_depth as i32;
+                        history[from as usize][to as usize] += iter_depth as i32 * iter_depth as i32;
                         if killers[0][0] != Some(*mv) {
                             killers[0][1] = killers[0][0];
                             killers[0][0] = Some(*mv);
                         }
                     }
                     if let Move::Castle { king, rook } = *mv {
-                        history[king as usize][rook as usize] += child_depth as i32 * child_depth as i32;
+                        history[king as usize][rook as usize] += iter_depth as i32 * iter_depth as i32;
                         if killers[0][0] != Some(*mv) {
                             killers[0][1] = killers[0][0];
                             killers[0][0] = Some(*mv);
@@ -2001,7 +2001,7 @@ pub fn best_move(pos: &Chess, depth: u32, game_history: &[u64]) -> Option<Move> 
             // (but did not cause a cutoff) gets a depth-weighted bonus, exactly
             // as negamax_impl does after its own move loop.
             if let Some((f, t)) = root_best_quiet {
-                history[f][t] += child_depth as i32;
+                history[f][t] += iter_depth as i32;
             }
 
             best_score = loop_best_score;
@@ -8897,5 +8897,106 @@ mod tests {
         let mv = best_move(&pos, 3, &[]);
         // The engine should prefer to play rather than give None.
         assert!(mv.is_some(), "best_move must return a move in this position");
+    }
+
+    // ── Cycle 11 Fix A: root history must use iter_depth not child_depth ────────
+    //
+    // In best_move's root loop, history credits/maluses used `child_depth` which
+    // equals `iter_depth.saturating_sub(1)` when the root is not in check.
+    // At iter_depth=1 this collapses to 0, so depth-1 iterative deepening never
+    // contributed to history-based move ordering.  Fix: use `iter_depth` for all
+    // five root history update sites.
+
+    /// At depth 1 with the root NOT in check, best_move must still find a legal
+    /// move.  This exercises the now-corrected history update path where
+    /// iter_depth=1 and child_depth would have been 0 before the fix.
+    #[test]
+    fn test_root_history_iter_depth1_not_in_check_legal_move() {
+        // Simple position: white up a queen, root not in check.
+        let pos = pos_from_fen("k7/8/8/8/8/8/8/K2Q4 w - - 0 1");
+        let mv = best_move(&pos, 1, &[]);
+        assert!(mv.is_some(), "depth-1 search must find a move (root not in check)");
+        let legal: MoveList = pos.legal_moves();
+        assert!(legal.iter().any(|m| m == &mv.clone().unwrap()),
+            "depth-1 move must be legal: {:?}", mv);
+    }
+
+    /// At depth 2, the history accumulated during the depth-1 iteration must
+    /// influence move ordering in the depth-2 iteration.  We verify the engine
+    /// still finds a correct result (no crash, returns a legal move) now that
+    /// depth-1 history uses iter_depth=1 instead of the bugged 0.
+    #[test]
+    fn test_root_history_iter_depth2_not_in_check_legal_move() {
+        let pos = pos_from_fen("k7/8/8/8/8/8/8/K2Q4 w - - 0 1");
+        let mv = best_move(&pos, 2, &[]);
+        assert!(mv.is_some(), "depth-2 search must find a move");
+        let legal: MoveList = pos.legal_moves();
+        assert!(legal.iter().any(|m| m == &mv.clone().unwrap()),
+            "depth-2 move must be legal: {:?}", mv);
+    }
+
+    /// When the root IS in check, child_depth == iter_depth (no subtraction),
+    /// so the root history bug did not apply.  Regression: this path must
+    /// continue to work correctly after the fix.
+    #[test]
+    fn test_root_history_root_in_check_still_works() {
+        // White king e1 is in check from black rook on e8; black king on a8.
+        let pos = pos_from_fen("k3r3/8/8/8/8/8/8/4K3 w - - 0 1");
+        assert!(pos.checkers().count() > 0, "position must have the root in check");
+        let mv = best_move(&pos, 2, &[]);
+        assert!(mv.is_some(), "engine must escape check");
+        let legal: MoveList = pos.legal_moves();
+        assert!(legal.iter().any(|m| m == &mv.clone().unwrap()),
+            "returned move must be legal: {:?}", mv);
+    }
+
+    // ── Cycle 11 Fix B: null-move must reset extensions to 0 ───────────────────
+    //
+    // negamax_impl's null-move call was passing the parent node's `extensions`
+    // counter to the null-move child.  If the parent had already accumulated
+    // MAX_EXTENSIONS extensions, the null-move subtree couldn't extend for checks
+    // at all, potentially causing false null-move cutoffs.
+    // Fix: pass `0` so the null-move subtree always has the full extension budget.
+
+    /// Call negamax_impl with extensions = MAX_EXTENSIONS (fully used up).
+    /// The null-move subtree must still work correctly — before the fix it
+    /// received the saturated counter, suppressing all check extensions inside
+    /// the null-move search.
+    #[test]
+    fn test_null_move_with_max_extensions_no_panic() {
+        // Material-rich middlegame so null-move actually fires.
+        let pos = pos_from_fen("rnbqkbnr/pppppppp/8/8/4P3/8/PPPP1PPP/RNBQKBNR b KQkq - 0 1");
+        let mut history = [[0i32; 64]; 64];
+        let mut killers: [[Option<Move>; 2]; MAX_PLY] = std::array::from_fn(|_| [None, None]);
+        let mut path: Vec<u64> = Vec::new();
+        let mut path_set: HashSet<u64> = HashSet::new();
+        let game_set: HashSet<u64> = HashSet::new();
+        let mut tt = vec![TtEntry::default(); 1 << 16];
+
+        // Pass extensions = MAX_EXTENSIONS: before the fix the null-move child
+        // would receive MAX_EXTENSIONS too, fully suppressing check extensions.
+        let score = negamax_impl(
+            &pos, 3, 0, -30000, 30000,
+            &mut path, &mut path_set, &game_set,
+            MAX_EXTENSIONS, &mut history, &mut killers, true, &mut tt,
+        );
+        // Score must be in valid range — any value proves it didn't panic or
+        // return a nonsensical value.
+        assert!(score >= -30000 && score <= 30000,
+            "score must be in valid range, got {score}");
+    }
+
+    /// Verify that with the fix, a search starting at extensions=MAX_EXTENSIONS
+    /// still returns a legal best move via best_move (which resets extensions
+    /// to 0 internally for each iteration).
+    #[test]
+    fn test_null_move_extensions_zero_legal_move_result() {
+        // Position with non-pawn pieces so null-move fires at depth 3.
+        let pos = pos_from_fen("rnbqkbnr/pppppppp/8/8/3PP3/8/PPP2PPP/RNBQKBNR b KQkq - 0 1");
+        let mv = best_move(&pos, 3, &[]);
+        assert!(mv.is_some(), "must return a move after null-move-extensions fix");
+        let legal: MoveList = pos.legal_moves();
+        assert!(legal.iter().any(|m| m == &mv.clone().unwrap()),
+            "returned move must be legal: {:?}", mv);
     }
 }
